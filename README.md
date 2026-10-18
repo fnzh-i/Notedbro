@@ -1,6 +1,23 @@
-# Cerebro
+<p align="center">
+  <img src="assets/branding/cerebro.png" alt="Cerebro" width="238">
+</p>
 
-A starter kit for Brain: a markdown vault that your AI agents (Cursor, Claude Code, Codex, and web chats) read for your rules, and file one short note into after each chat.
+<p align="center">
+  A starter kit for Brain: a markdown vault that your AI agents (Cursor, Claude Code, Codex, and web chats) read for your rules, and file one short note into after each chat.
+</p>
+
+<p align="center">
+  <a href="How%20to%20set%20up.md">How to set up</a> ·
+  <a href="Prerequisites.md">Prerequisites</a> ·
+  <a href="CONTRIBUTING.md">Contributing</a> ·
+  <a href="DESIGN.md">Design</a>
+</p>
+
+<p align="center">
+  <img src="assets/branding/screenshot.png" alt="Screenshot">
+</p>
+
+---
 
 - [Prerequisites](Prerequisites.md): what to install
 - [How to set up](How%20to%20set%20up.md): clone to first `Brain ready`

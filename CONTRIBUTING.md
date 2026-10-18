@@ -3,7 +3,7 @@
 Pull requests go to https://github.com/fnzh-i/Cerebro.
 
 1. Branch from `main`. One change per pull request.
-2. Change only shared files: the shared notes, `AGENTS.md`, `CLAUDE.md`, the repo docs, `Hosts/`, `_Templates/`, `_Scripts/`, and `.github/`.
+2. Change only shared files: the shared notes, `AGENTS.md`, `CLAUDE.md`, the repo docs, `Hosts/`, `_Templates/`, `_Scripts/`, `.github/`, and `assets/`.
 3. Never `git add -f` a note. If git ignores a file, it stays on your machine.
 4. Use the example vocabulary: `Example`, `EX-NNN`, `Work/Example/`. Real names, employers, ticket keys, and paths go in your own `Workspace map.md`.
 5. Run `python3 _Scripts/check-vault` and the `_Scripts/check-*` scripts you touched. All must pass.

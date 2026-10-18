@@ -47,7 +47,7 @@ INCLUDE_FILES = (
     "CODE_OF_CONDUCT.md",
     "LICENSE",
 )
-INCLUDE_DIRS = ("Hosts", ".github", "_Templates", "_Scripts")
+INCLUDE_DIRS = ("Hosts", ".github", "_Templates", "_Scripts", "assets")
 EXCLUDE_PARTS = {"host-restore", "__pycache__", ".DS_Store"}
 HUBS = (
     ("Work/Example", "Example"),
@@ -60,6 +60,7 @@ AREAS = ("Personal", "Work", "Collaboration", "Hackathons", "Research", "Plans")
 
 EMAIL = re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b")
 PHONE = re.compile(r"(?<![\w.-])(?:\+?\d{1,3}[ .-])?\(?\d{3}\)?[ .-]\d{3}[ .-]\d{4}(?![\w.-])")
+IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".ico", ".bmp"}
 ALLOWED_URL = re.compile(re.escape(REPO_URL) + r"[A-Za-z0-9/._#?=&-]*")
 
 
@@ -246,14 +247,14 @@ def scan(root, terms):
     hits = []
     for path in iter_files(root):
         rel = path.relative_to(root).as_posix()
+        if path.suffix.lower() in IMAGE_SUFFIXES:
+            continue
         try:
             text = path.read_bytes().decode("utf-8", errors="replace")
         except OSError:
             hits.append(f"{rel}: unreadable")
             continue
         text = ALLOWED_URL.sub("", text)
-        if rel == "README.md":
-            text = re.sub(rf"(?m)^# {re.escape(PRODUCT)}[ \t]*$", "", text, count=1)
         kinds = []
         if EMAIL.search(text):
             kinds.append("email")
@@ -263,7 +264,7 @@ def scan(root, terms):
             kinds.append("home folder")
         if login.search(text):
             kinds.append("login name")
-        if rel != "DESIGN.md" and product.search(text):
+        if rel not in ("DESIGN.md", "README.md") and not rel.startswith("assets/") and product.search(text):
             kinds.append(f"{PRODUCT} outside the title")
         for term, pattern in patterns:
             if pattern.search(text):
@@ -400,6 +401,16 @@ def self_check():
                 raise SystemExit(f"self-check: {word!r} matched a term inside a word")
         if not scan_text_hits("fnsh " + "ci" + "si params", ["ci" + "si"]):
             raise SystemExit("self-check: a standalone term was missed")
+
+        noise = vault / "assets" / "branding" / "noise.png"
+        noise.parent.mkdir(parents=True, exist_ok=True)
+        noise.write_bytes(b"\x89PNG\r\n\x1a\n" + planted_project.encode("ascii"))
+        reply, ok = publish(vault, out, denylist)
+        if not ok or reply != f"Published: {shown(out)}":
+            raise SystemExit(f"self-check: an image with denylist bytes was withheld:\n{reply}")
+        if not (out / "assets" / "branding" / "noise.png").is_file():
+            raise SystemExit("self-check: the image was not published")
+        noise.unlink()
 
         write(vault / "Personal" / "Personal.md", "---\ntags: [area]\n---\n# My real hub\n")
         reply, ok = publish(vault, out, denylist)
