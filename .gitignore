@@ -1,0 +1,34 @@
+# Notes stay on your machine. Only the starter hubs are tracked.
+/Personal/**
+/Work/**
+/Collaboration/**
+/Hackathons/**
+/Research/**
+/Plans/**
+!/Work/
+!/Work/Example/
+!/Work/Example/Example.md
+!/Personal/
+!/Personal/Personal.md
+!/Collaboration/
+!/Collaboration/Collaboration.md
+!/Hackathons/
+!/Hackathons/Hackathons.md
+!/Research/
+!/Research/Research.md
+!/Personal/Chats/
+!/Personal/Chats/Chats.md
+
+/Workspace map.md
+!/Workspace map.example.md
+/_Scripts/host-restore/
+Skill files/
+.obsidian/
+*.canvas
+*.jsonl
+.DS_Store
+.env
+*.pem
+*.age
+shadow.key
+__pycache__/

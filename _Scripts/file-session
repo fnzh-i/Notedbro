@@ -1,0 +1,1362 @@
+#!/usr/bin/env python3
+"""File one session note and one Daily line.
+
+Reads host, model, conversation id, and transcript path. Writes only inside
+the vault. Does not edit config files and does not decide conflicts.
+"""
+import datetime
+import hashlib
+import json
+import os
+import re
+import subprocess
+import sys
+import urllib.error
+import urllib.request
+
+from provenance import provenance_tags
+from workspace_map import load_map
+
+VAULT = os.path.realpath(os.path.expanduser(os.environ.get("BRAIN_VAULT", "~/Documents/Brain")))
+CHANGE_TOOLS = {"Write", "StrReplace", "Edit", "EditNotebook", "NotebookEdit"}
+PATH_KEYS = ("path", "file_path", "notebook_path", "target_notebook")
+HOME = os.path.expanduser("~")
+# Haiku 4.5 list price, USD per million tokens. Used only to stay under the cap.
+INPUT_USD_PER_MTOK = 1.0
+OUTPUT_USD_PER_MTOK = 5.0
+PROFILES = {
+    "claude": "Hosts/Claude",
+    "cursor": "Hosts/Cursor",
+    "codex": "Hosts/Codex",
+    "chatgpt": "Hosts/Web",
+    "claude-ai": "Hosts/Web",
+    "gemini": "Hosts/Web",
+    "unknown": "Hosts/Unknown",
+}
+WEB_HOSTS = {"chatgpt", "claude-ai", "gemini", "unknown"}
+ACTION_WORDS = {"brain", "update", "params", "prefs", "remember", "load", "ticket", "config", "wins", "plan", "check", "shadow", "publish", "sync", "rebuild"}
+PLAN_NAME = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
+ACTION_LETTER = {
+    "load": "l",
+    "brain": "b",
+    "params": "p",
+    "prefs": "f",
+    "remember": "r",
+    "config": "c",
+    "wins": "w",
+    "ticket": "t",
+    "update": "u",
+}
+CODE_LETTERS = set(ACTION_LETTER.values())
+PARAM_SETS = {"main", "example"}
+FIXED_AREAS = {"personal": "Personal", "collaboration": "Collaboration", "research": "Research", "hackathon": "Hackathons"}
+REBUILD_HOSTS = {"cursor", "claude", "codex", "web", "chatgpt", "claude-ai", "gemini", "unknown", "all"}
+LOAD_HOSTS = {"claude-ai", "chatgpt", "gemini", "cursor", "claude", "codex", "unknown"}
+TICKET_TOKEN = re.compile(r"^[A-Za-z][A-Za-z0-9]*-\d+$")
+ALIAS_LITERALS = (
+    ("use my example parameters", "fnsh example params"),
+    ("use my preferences", "fnsh prefs"),
+    ("use company config", "fnsh config"),
+    ("update the brain", "fnsh update"),
+    ("use my parameters", "fnsh params"),
+    ("remember this", "fnsh remember"),
+    ("brain wins", "fnsh wins"),
+    ("use brain", "fnsh brain"),
+)
+
+
+def workspace_map():
+    return load_map(VAULT)
+
+
+def param_sets():
+    return PARAM_SETS | set(workspace_map()["param_sets"])
+
+
+def alias_literals():
+    return tuple(workspace_map()["prefix_aliases"]) + ALIAS_LITERALS
+
+
+def inside_vault(path):
+    real = os.path.realpath(path)
+    return real == VAULT or real.startswith(VAULT + os.sep)
+
+
+def read_text(path):
+    with open(path, errors="ignore") as fh:
+        return fh.read()
+
+
+def write_text(path, text):
+    if not inside_vault(path):
+        raise SystemExit("file-session: refused to write outside the vault")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w") as fh:
+        fh.write(text)
+
+
+def parameters_from_text(text):
+    found = {
+        "min_turns": 3,
+        "skip_if_no_changes": True,
+        "filer_model": "",
+        "filer_cost_cap_usd": 0.05,
+        "refile_min_new_turns": 5,
+    }
+    for line in text.splitlines():
+        match = re.match(
+            r"^(min_turns|skip_if_no_changes|filer_model|filer_cost_cap_usd|refile_min_new_turns):\s*(\S*)\s*$",
+            line,
+        )
+        if not match:
+            continue
+        key, raw = match.group(1), match.group(2)
+        if key == "filer_model":
+            found[key] = raw
+            continue
+        if not raw:
+            continue
+        if key in ("min_turns", "refile_min_new_turns"):
+            found[key] = int(raw)
+        elif key == "filer_cost_cap_usd":
+            found[key] = float(raw)
+        elif key == "skip_if_no_changes":
+            found[key] = raw.lower() == "true"
+    return found
+
+
+def parameters():
+    path = os.path.join(VAULT, "Parameters.md")
+    if not os.path.isfile(path):
+        return parameters_from_text("")
+    return parameters_from_text(read_text(path))
+
+
+def yaml_quote(value):
+    text = str(value).replace("\n", " ").strip()
+    if not text:
+        return '""'
+    if re.search(r'[:#\[\]{}&*!|>%@`,]|^\s|\s$', text) or text.lower() in ("true", "false", "null"):
+        return '"' + text.replace("\\", "\\\\").replace('"', '\\"') + '"'
+    return text
+
+
+def message_text(event):
+    content = event.get("message", event.get("content"))
+    if isinstance(content, str):
+        return content
+    if isinstance(content, dict):
+        content = content.get("content")
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return ""
+    parts = []
+    for block in content:
+        if isinstance(block, str):
+            parts.append(block)
+        elif isinstance(block, dict) and block.get("text"):
+            parts.append(str(block["text"]))
+    return "\n".join(parts)
+
+
+def clean_request(text):
+    match = re.search(r"<user_query>\s*(.*?)\s*</user_query>", text, re.S)
+    if match:
+        text = match.group(1)
+    text = re.sub(r"<image_files>.*?</image_files>", " ", text, flags=re.S)
+    text = re.sub(r"</?[A-Za-z0-9_]+>", " ", text)
+    text = re.sub(r"\b(?:sk-|ghp_|github_pat_|xox[baprs]-)[A-Za-z0-9_\-]+", " ", text)
+    return " ".join(text.split())
+
+
+def user_messages(events):
+    messages = []
+    for event in events:
+        role = event.get("role") or event.get("type")
+        if role not in ("user", "human"):
+            continue
+        raw = message_text(event)
+        if "Brain vault reminder:" in raw and "<user_query>" not in raw:
+            continue
+        cleaned = clean_request(raw)
+        if "Brain vault reminder:" in cleaned:
+            continue
+        if cleaned:
+            messages.append(cleaned)
+    return messages
+
+
+def load_events(path):
+    events = []
+    with open(path, errors="ignore") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                event = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(event, dict):
+                events.append(event)
+    return events
+
+
+def tool_path(inp):
+    for key in PATH_KEYS:
+        raw = inp.get(key)
+        if raw:
+            return os.path.normpath(os.path.expanduser(str(raw)))
+    return ""
+
+
+def tool_uses(events):
+    for event in events:
+        content = (event.get("message") or {}).get("content")
+        if not isinstance(content, list):
+            content = event.get("content") if isinstance(event.get("content"), list) else None
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if not isinstance(block, dict) or block.get("type") not in ("tool_use", "tool_call"):
+                continue
+            name = block.get("name") or ""
+            inp = block.get("input") or {}
+            if isinstance(inp, dict):
+                yield name, inp
+
+
+def has_changes(events):
+    for name, inp in tool_uses(events):
+        if name in CHANGE_TOOLS and tool_path(inp):
+            return True
+        if name in ("Shell", "Bash") and "git commit" in str(inp.get("command", "")):
+            return True
+    return False
+
+
+def changed_summary(events):
+    names = []
+    committed = False
+    for name, inp in tool_uses(events):
+        if name in CHANGE_TOOLS and tool_path(inp):
+            base = os.path.basename(tool_path(inp))
+            if base and base not in names:
+                names.append(base)
+        elif name in ("Shell", "Bash") and "git commit" in str(inp.get("command", "")):
+            committed = True
+    if names:
+        if len(names) == 1:
+            listed = names[0]
+        elif len(names) == 2:
+            listed = f"{names[0]} and {names[1]}"
+        else:
+            listed = ", ".join(names[:-1]) + ", and " + names[-1]
+        return f"Edited {listed}."
+    if committed:
+        return "Committed"
+    return "Nothing on disk"
+
+
+def words_of(text):
+    return re.findall(r"[A-Za-z0-9]+(?:'[A-Za-z0-9]+)?", text)
+
+
+def one_or_two_sentences(text):
+    text = " ".join(text.split())
+    parts = [part.strip() for part in re.split(r"(?<=[.!?])\s+", text) if part.strip()]
+    if not parts:
+        return text
+    return " ".join(parts[:2])
+
+
+def qualifying_message(messages):
+    for message in messages:
+        if len(words_of(message)) >= 5:
+            return message
+    return ""
+
+
+def local_card(messages, events, label):
+    source = qualifying_message(messages)
+    if source:
+        title = " ".join(words_of(source)[:6])
+        asked = one_or_two_sentences(source)
+    else:
+        title = (label or "").strip() or "Chat"
+        asked = messages[0].strip() if messages else ""
+    if not title:
+        title = "Chat"
+    return {
+        "title": title,
+        "asked": asked,
+        "changed": changed_summary(events),
+        "truncated": False,
+        "filer": "local",
+    }
+
+
+def select_card(messages, events, label, model_name, key, call):
+    model_name = (model_name or "").strip()
+    card = local_card(messages, events, label)
+    if not model_name:
+        return card
+    if not key:
+        card["filer_error"] = "no api key"
+        return card
+    result = call()
+    if not result:
+        card["filer_error"] = "model call failed"
+        return card
+    result["filer"] = "model"
+    result.pop("filer_error", None)
+    return result
+
+
+def take_load(words, index):
+    """Host, then optional scope. Scope stops at a full action word."""
+    if index >= len(words) or words[index].lower() not in LOAD_HOSTS:
+        return None
+    parts = [words[index].lower()]
+    index += 1
+    if index < len(words) and words[index].lower() == "all":
+        parts.append("all")
+        index += 1
+    elif index < len(words) and words[index].lower() in ("company", "project"):
+        kind = words[index].lower()
+        name = []
+        cursor = index + 1
+        while cursor < len(words) and words[cursor].lower() not in ACTION_WORDS:
+            name.append(words[cursor])
+            cursor += 1
+        if name:
+            parts.append(kind)
+            parts.append(" ".join(name))
+            index = cursor
+    return " ".join(parts), index
+
+
+def order_letters(letters):
+    seen = []
+    for letter in letters:
+        if letter not in seen:
+            seen.append(letter)
+    ordered = [letter for letter in ("l", "b") if letter in seen]
+    ordered.extend(letter for letter in seen if letter not in ("l", "b", "u"))
+    if "u" in seen:
+        ordered.append("u")
+    return ordered
+
+
+def chain_phrase(letters, set_name, load_text, ticket_text):
+    ordered = order_letters(letters)
+    if not ordered:
+        return ""
+    head = "fnsh"
+    if set_name:
+        head += " " + set_name
+    head += " -" + "".join(ordered)
+    tail = [part for part in (load_text, ticket_text) if part]
+    if tail:
+        head += " " + " ".join(tail)
+    return head
+
+
+def parse_dash(token, rest, preset):
+    body = token[1:]
+    if not body:
+        return None
+    raw = []
+    for char in body:
+        lower = char.lower()
+        if not lower.isalpha():
+            return None
+        raw.append(lower)
+    included = []
+    seen = set()
+    index = 0
+    load_text = ""
+    ticket_text = ""
+    for letter in raw:
+        if letter not in CODE_LETTERS:
+            break
+        if letter in seen:
+            continue
+        seen.add(letter)
+        if letter == "l":
+            taken = take_load(rest, index)
+            if not taken:
+                break
+            load_text, index = taken
+        elif letter == "t":
+            if index >= len(rest) or not TICKET_TOKEN.match(rest[index]):
+                break
+            ticket_text = rest[index]
+            index += 1
+        included.append(letter)
+    if not included:
+        return None
+    set_name = ""
+    dropped = ""
+    if preset:
+        if "p" in included and preset != "main":
+            set_name = preset
+        elif "p" not in included:
+            dropped = preset
+    phrase = chain_phrase(included, set_name, load_text, ticket_text)
+    if not phrase:
+        return None
+    return {"phrase": phrase, "dropped_set": dropped}
+
+
+def parse_solo(action, rest, preset=""):
+    if action == "params":
+        if preset and preset != "main":
+            return {"phrase": "fnsh " + preset + " params", "dropped_set": ""}
+        return {"phrase": "fnsh params", "dropped_set": ""}
+    if action == "load":
+        taken = take_load(rest, 0)
+        if not taken:
+            return None
+        return {"phrase": "fnsh load " + taken[0], "dropped_set": ""}
+    if action == "ticket":
+        if not rest or not TICKET_TOKEN.match(rest[0]):
+            return None
+        return {"phrase": "fnsh ticket " + rest[0], "dropped_set": ""}
+    if action == "plan":
+        if rest and rest[0].lower() == "list":
+            return {"phrase": "fnsh plan list", "dropped_set": ""}
+        if rest and rest[0].lower() in ("save", "load") and len(rest) >= 2:
+            name = rest[1].lower()
+            if PLAN_NAME.fullmatch(name):
+                return {"phrase": "fnsh plan " + rest[0].lower() + " " + name, "dropped_set": ""}
+        return {"phrase": "fnsh plan", "dropped_set": ""}
+    if action == "rebuild" and rest and rest[0].lower() in REBUILD_HOSTS:
+        return {"phrase": "fnsh rebuild " + rest[0].lower(), "dropped_set": ""}
+    if action in ACTION_WORDS:
+        return {"phrase": "fnsh " + action, "dropped_set": ""}
+    return None
+
+
+def parse_alias(stripped):
+    lower = stripped.lower()
+    for old, new in alias_literals():
+        if lower == old or lower.startswith(old + " ") or lower.startswith(old + ":"):
+            return {"phrase": new, "dropped_set": ""}
+    words = stripped.split()
+    if not words:
+        return None
+    head = words[0].lower()
+    if head == "load":
+        return parse_solo("load", words[1:])
+    if head == "ticket":
+        return parse_solo("ticket", words[1:])
+    return None
+
+
+def parse_fnsh(words):
+    if not words:
+        return None
+    first = words[0]
+    if first.startswith("-"):
+        return parse_dash(first, words[1:], "")
+    lower = first.lower()
+    if lower in ACTION_WORDS:
+        return parse_solo(lower, words[1:])
+    if lower in param_sets() and len(words) >= 2:
+        nxt = words[1]
+        if nxt.lower() == "params":
+            return parse_solo("params", words[2:], lower)
+        if nxt.startswith("-"):
+            return parse_dash(nxt, words[2:], lower)
+    return None
+
+
+def parse_prefix_line(line):
+    """One counting line. None when the line is not a prefix."""
+    stripped = (line or "").strip()
+    if not stripped:
+        return None
+    words = stripped.split()
+    if words[0].lower() != "fnsh":
+        return parse_alias(stripped)
+    return parse_fnsh(words[1:])
+
+
+def setup_chain(phrase):
+    """Dash form used to count a repeated combination. main is dropped."""
+    words = (phrase or "").split()
+    if len(words) < 2 or words[0].lower() != "fnsh":
+        return ""
+    rest = words[1:]
+    set_name = ""
+    if rest[0].lower() in param_sets():
+        if rest[0].lower() != "main":
+            set_name = rest[0].lower()
+        rest = rest[1:]
+    if not rest:
+        return ""
+    if rest[0].startswith("-"):
+        letters = list(rest[0][1:].lower())
+        kept_set = set_name if "p" in letters else ""
+        head = chain_phrase(letters, kept_set, "", "")
+        if len(rest) == 1:
+            return head
+        return head + " " + " ".join(rest[1:])
+    letter = ACTION_LETTER.get(rest[0].lower())
+    if not letter:
+        return ""
+    kept_set = set_name if letter == "p" else ""
+    return chain_phrase([letter], kept_set, "", "") + (
+        "" if len(rest) == 1 else " " + " ".join(rest[1:])
+    )
+
+
+def typed_prefixes(messages):
+    found = []
+    seen = set()
+
+    def add(phrase):
+        key = phrase.casefold()
+        if key in seen:
+            return
+        seen.add(key)
+        found.append(phrase)
+
+    for message in messages:
+        if not isinstance(message, str):
+            continue
+        lines = [message] + message.splitlines()
+        for line in lines:
+            parsed = parse_prefix_line(line)
+            if parsed and parsed.get("phrase"):
+                add(parsed["phrase"])
+    return found
+
+
+def refresh_snapshot(host):
+    """Refresh that host's snapshot. A failure here does not undo the session note."""
+    if host not in ("claude", "cursor"):
+        return
+    script = os.path.join(VAULT, "_Scripts", "load-host")
+    if not os.path.isfile(script):
+        return
+    try:
+        subprocess.run([sys.executable, script, "--snapshot", host], check=False)
+    except OSError as error:
+        print(f"file-session: snapshot skipped: {error}", file=sys.stderr)
+
+
+def refresh_views():
+    """Rebuild the decisions and sessions canvas. A failure here does not undo the session note."""
+    script = os.path.join(VAULT, "_Scripts", "build-views")
+    if not os.path.isfile(script):
+        return
+    try:
+        subprocess.run([sys.executable, script], check=False, timeout=30)
+    except (OSError, subprocess.SubprocessError) as error:
+        print(f"file-session: views skipped: {error}", file=sys.stderr)
+
+
+def model_from_events(events):
+    for event in events:
+        for key in ("model", "model_name"):
+            value = event.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        message = event.get("message")
+        if isinstance(message, dict):
+            value = message.get("model")
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+    return ""
+
+
+def api_key():
+    for name in ("BRAIN_FILER_API_KEY", "ANTHROPIC_API_KEY"):
+        value = os.environ.get(name, "").strip()
+        if value:
+            return value
+    try:
+        out = subprocess.run(
+            ["security", "find-generic-password", "-s", "brain-filer", "-w"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+    if out.returncode == 0:
+        return out.stdout.strip()
+    return ""
+
+
+def truncate_for_cap(text, cap):
+    max_out = 400
+    output_cost = max_out / 1_000_000 * OUTPUT_USD_PER_MTOK
+    input_budget = max(cap - output_cost, cap * 0.8)
+    max_tokens = max(int(input_budget / INPUT_USD_PER_MTOK * 1_000_000) - 800, 1000)
+    max_chars = max_tokens * 4
+    if len(text) <= max_chars:
+        return text, False
+    return text[-max_chars:], True
+
+
+def call_model(model, transcript, cap):
+    key = api_key()
+    if not key:
+        return None
+    body_text, truncated = truncate_for_cap(transcript, cap)
+    payload = {
+        "model": model,
+        "max_tokens": 400,
+        "messages": [{
+            "role": "user",
+            "content": (
+                "Write a short session card from this transcript. "
+                "Return only JSON with keys title, asked, changed. "
+                "title is at most six words and has no date. "
+                "asked is one or two sentences on what the user asked. "
+                "changed is one or two sentences on what changed. "
+                'If nothing changed on disk, changed must be exactly "Nothing on disk". '
+                "Leave out secrets, keys, and personal data.\n\n"
+                + body_text
+            ),
+        }],
+    }
+    request = urllib.request.Request(
+        "https://api.anthropic.com/v1/messages",
+        data=json.dumps(payload).encode(),
+        headers={
+            "content-type": "application/json",
+            "x-api-key": key,
+            "anthropic-version": "2023-06-01",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            data = json.loads(response.read().decode())
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, OSError):
+        return None
+    parts = []
+    for block in data.get("content") or []:
+        if isinstance(block, dict) and block.get("type") == "text":
+            parts.append(block.get("text") or "")
+    raw = "\n".join(parts).strip()
+    match = re.search(r"\{.*\}", raw, re.S)
+    if not match:
+        return None
+    try:
+        card = json.loads(match.group(0))
+    except json.JSONDecodeError:
+        return None
+    title = str(card.get("title") or "").strip()
+    asked = str(card.get("asked") or "").strip()
+    changed = str(card.get("changed") or "").strip()
+    if not title or not asked or not changed:
+        return None
+    return {"title": title, "asked": asked, "changed": changed, "truncated": truncated}
+
+
+def project_slug(name):
+    return re.sub(r"[^a-z0-9]+", "-", str(name).lower()).strip("-")
+
+
+def known_projects():
+    found = {}
+
+    def add(name):
+        found[name.lower()] = name
+
+    found_map = workspace_map()
+    for name in found_map["projects"]:
+        add(name)
+    company = found_map["company"]
+    if company:
+        add(company)
+    add("Chats")
+    root = os.path.join(VAULT, "Work", company, "Projects") if company else ""
+    if root and os.path.isdir(root):
+        for name in os.listdir(root):
+            if os.path.isfile(os.path.join(root, name, name + ".md")):
+                add(name)
+    collaboration = os.path.join(VAULT, "Collaboration")
+    if os.path.isdir(collaboration):
+        for name in os.listdir(collaboration):
+            if os.path.isfile(os.path.join(collaboration, name, name + ".md")):
+                add(name)
+    personal = os.path.join(VAULT, "Personal")
+    if os.path.isdir(personal):
+        for name in os.listdir(personal):
+            if name == "Daily":
+                continue
+            if os.path.isfile(os.path.join(personal, name, name + ".md")):
+                add(name)
+    for alias, name in found_map["project_aliases"].items():
+        found[alias] = name
+    return found
+
+
+def project_note_path(name):
+    company = workspace_map()["company"]
+    if company and name == company:
+        return os.path.join(VAULT, "Work", company, company + ".md")
+    if company:
+        work = os.path.join(VAULT, "Work", company, "Projects", name, name + ".md")
+        if os.path.isfile(work):
+            return work
+    collaboration = os.path.join(VAULT, "Collaboration", name, name + ".md")
+    if os.path.isfile(collaboration):
+        return collaboration
+    personal = os.path.join(VAULT, "Personal", name, name + ".md")
+    if os.path.isfile(personal):
+        return personal
+    research = os.path.join(VAULT, "Research", name, name + ".md")
+    if os.path.isfile(research):
+        return research
+    hack = os.path.join(VAULT, "Hackathons", name, name + ".md")
+    if os.path.isfile(hack):
+        return hack
+    return ""
+
+
+def project_home(name):
+    note = project_note_path(name)
+    if not note:
+        return None
+    folder = os.path.dirname(note)
+    rel = os.path.relpath(folder, VAULT)
+    if rel.startswith("Work" + os.sep):
+        area = project_slug(rel.split(os.sep)[1])
+    elif rel.startswith("Collaboration" + os.sep):
+        area = "collaboration"
+    elif rel.startswith("Research" + os.sep):
+        area = "research"
+    elif rel.startswith("Hackathons" + os.sep):
+        area = "hackathon"
+    else:
+        area = "personal"
+    return {
+        "name": name,
+        "area": area,
+        "folder": os.path.join(rel, "Sessions"),
+        "index": os.path.join(rel, name + " sessions.md"),
+        "note": os.path.relpath(note, VAULT),
+    }
+
+
+def chats_home():
+    return project_home("Chats")
+
+
+def project_from_workspace(workspace):
+    if not workspace:
+        return None
+    path = os.path.normpath(os.path.expanduser(workspace))
+    best = None
+    best_len = -1
+    found_map = workspace_map()
+    for root, name, _area in found_map["workspaces"]:
+        if path == root or path.startswith(root + os.sep):
+            if len(root) > best_len:
+                best = project_home(name)
+                best_len = len(root)
+    if best:
+        return best
+    company_root = found_map["workspace"]
+    if found_map["company"] and company_root and (path == company_root or path.startswith(company_root + os.sep)):
+        known = known_projects()
+        current = path
+        while current == company_root or current.startswith(company_root + os.sep):
+            home = project_home(known.get(os.path.basename(current).lower(), ""))
+            if home and home["name"] != "Chats":
+                return home
+            if current == company_root:
+                break
+            parent = os.path.dirname(current)
+            if parent == current:
+                break
+            current = parent
+        return project_home(found_map["company"])
+    found = known_projects()
+    name = found.get(os.path.basename(path).lower())
+    if name and name != "Chats":
+        return project_home(name)
+    return None
+
+
+def project_from_ticket(messages):
+    if not messages:
+        return None
+    key = workspace_map()["ticket_key"]
+    if not key:
+        return None
+    match = re.search(rf"\b({re.escape(key)}-\d+)\b", messages[0], re.I)
+    if not match:
+        return None
+    ticket = match.group(1).upper()
+    matches = []
+    for root, dirs, files in os.walk(VAULT):
+        dirs[:] = [name for name in dirs if name not in (".git", "Skill files", "_Scripts", "_Templates", "_Config")]
+        filename = ticket + ".md"
+        if filename in files and os.path.basename(root) == "Tickets":
+            matches.append(os.path.join(root, filename))
+    if not matches:
+        return None
+    text = read_text(matches[0])
+    link = re.search(r"Project:\s*\[\[(.+?)\]\]", text)
+    if not link:
+        return None
+    return project_home(link.group(1).strip())
+
+
+def is_private(home):
+    if not home:
+        return False
+    path = os.path.join(VAULT, home["note"])
+    if not os.path.isfile(path):
+        return False
+    head = read_text(path).split("---", 2)
+    if len(head) < 3:
+        return False
+    return re.search(r"(?m)^private:\s*true\s*$", head[1]) is not None
+
+
+def find_note(conversation):
+    marker = f"conversation: {conversation}"
+    for root, dirs, files in os.walk(VAULT):
+        dirs[:] = [name for name in dirs if name not in (".git", "Skill files", "_Scripts", "_Templates", "_Config")]
+        if os.path.basename(root) != "Sessions":
+            continue
+        for name in files:
+            if not name.endswith(".md"):
+                continue
+            path = os.path.join(root, name)
+            try:
+                head = read_text(path)[:2000]
+            except OSError:
+                continue
+            if marker in head:
+                return path
+    return ""
+
+
+def frontmatter_value(text, key):
+    match = re.match(r"---\n(.*?)\n---", text, re.S)
+    if not match:
+        return ""
+    field = re.search(rf"(?m)^{re.escape(key)}:\s*(.+)$", match.group(1))
+    if not field:
+        return ""
+    return field.group(1).strip().strip('"')
+
+
+def fallback_id(host, first_message):
+    now = datetime.datetime.now().strftime("%Y-%m-%d-%H%M%S")
+    digest = hashlib.sha256((first_message or host).encode()).hexdigest()[:8]
+    return f"{host}-{now}-{digest}"
+
+
+def company_folder(home):
+    """Work/<Company> folder name for a company home, else empty."""
+    if home["area"] in FIXED_AREAS:
+        return ""
+    parts = home["note"].split(os.sep)
+    return parts[1] if len(parts) > 2 and parts[0] == "Work" else ""
+
+
+def daily_heading(home, today):
+    company = company_folder(home)
+    if company:
+        return today if workspace_map()["daily_date_only"] else f"{today} {company}"
+    return f"{today} {FIXED_AREAS[home['area']]}"
+
+
+def daily_path(home, today):
+    company = company_folder(home)
+    if company:
+        return os.path.join(VAULT, "Work", company, "Daily", daily_heading(home, today) + ".md")
+    return os.path.join(VAULT, FIXED_AREAS[home["area"]], "Daily", daily_heading(home, today) + ".md")
+
+
+def upsert_daily(home, today, title, conversation):
+    path = daily_path(home, today)
+    line = f"- [[{title}]] · {conversation}"
+    if os.path.isfile(path):
+        text = read_text(path)
+        lines = text.splitlines()
+        for index, existing in enumerate(lines):
+            if conversation in existing:
+                if lines[index] != line:
+                    lines[index] = line
+                    write_text(path, "\n".join(lines) + ("\n" if text.endswith("\n") else ""))
+                return
+        section = "## What we did\n"
+        if section in text:
+            at = text.index(section) + len(section)
+            rest = text[at:]
+            nxt = re.search(r"\n## ", rest)
+            if nxt:
+                insert_at = at + nxt.start()
+                text = text[:insert_at] + "\n" + line + text[insert_at:]
+            else:
+                if not text.endswith("\n"):
+                    text += "\n"
+                text += line + "\n"
+        else:
+            if not text.endswith("\n"):
+                text += "\n"
+            text += line + "\n"
+        write_text(path, text)
+        return
+    tags = ["daily", "temporal", home["area"]]
+    slug = project_slug(home["name"])
+    if slug and slug != home["area"]:
+        tags.append(slug)
+    heading = daily_heading(home, today)
+    note = (
+        f"---\ndate: {today}\ntags: [{', '.join(tags)}]\n---\n"
+        f"# {heading}\n\n"
+        f"## What we did\n{line}\n\n"
+        f"## What changed\n- \n\n"
+        f"## Next steps\n- [ ] \n\n"
+        f"## Links\nProjects: [[{home['name']}]]\n"
+    )
+    write_text(path, note)
+
+
+def ensure_index(home, title):
+    path = os.path.join(VAULT, home["index"])
+    bullet = f"- [[{title}]]"
+    if os.path.isfile(path):
+        text = read_text(path)
+        if f"[[{title}]]" in text:
+            return
+        if not text.endswith("\n"):
+            text += "\n"
+        write_text(path, text + bullet + "\n")
+        return
+    write_text(path, (
+        f"---\ntags: [session, {home['area']}, {project_slug(home['name'])}]\nstatus: active\n---\n"
+        f"# {home['name']} sessions\n\n"
+        f"Chats for [[{home['name']}]]. Each line is its own note, linked in date order.\n"
+        f"{bullet}\n"
+    ))
+
+
+def render_note(fields, title, asked, changed):
+    lines = ["---", f"date: {fields['date']}", f"host: {fields['host']}", f"model: {yaml_quote(fields['model'])}"]
+    lines.append(f"filer: {fields.get('filer') or 'local'}")
+    if fields.get("filer_error"):
+        lines.append(f"filer_error: {yaml_quote(fields['filer_error'])}")
+    lines.append(f"profile: {fields['profile']}")
+    lines.append(f"conversation: {yaml_quote(fields['conversation'])}")
+    lines.append(f"transcript: {yaml_quote(fields['transcript'])}")
+    if fields.get("truncated"):
+        lines.append("truncated: true")
+    if fields.get("configs_read"):
+        lines.append("configs_read:")
+        for item in fields["configs_read"]:
+            lines.append(f"  - {yaml_quote(item)}")
+    if fields.get("conflicts"):
+        lines.append(f"conflicts: {yaml_quote(fields['conflicts'])}")
+    if fields.get("prefixes"):
+        lines.append("prefixes:")
+        for item in fields["prefixes"]:
+            lines.append(f"  - {yaml_quote(item)}")
+    if fields.get("repeats"):
+        lines.append("repeats:")
+        for item in fields["repeats"]:
+            lines.append(f"  - ask: {yaml_quote(item['ask'])}")
+            lines.append(f"    chats: {int(item['chats'])}")
+            if item.get("offered"):
+                lines.append("    offered: true")
+    lines.append(f"filed_turns: {fields['filed_turns']}")
+    lines.append(f"tags: [{', '.join(fields['tags'])}]")
+    lines.append("---")
+    lines.append(f"# {title}")
+    lines.append("")
+    lines.append(f"Project: [[{fields['project']}]]")
+    lines.append("")
+    lines.append("## Asked")
+    lines.append(asked)
+    lines.append("")
+    lines.append("## Changed")
+    lines.append(changed)
+    lines.append("")
+    return "\n".join(lines)
+
+
+def minimal_card(host, today):
+    return {
+        "title": f"{today} {host} transcript unavailable",
+        "asked": "transcript unavailable",
+        "changed": "transcript unavailable",
+        "truncated": False,
+        "filer": "local",
+    }
+
+
+def short_title(text, label, today):
+    words = re.findall(r"[A-Za-z0-9]+(?:'[A-Za-z0-9]+)?", text)
+    filler = {"a", "an", "the", "to", "for", "of", "and", "or", "please", "can", "you", "i", "me", "my"}
+    kept = [word for word in words if word.lower() not in filler] or words
+    short = " ".join(kept[:6]).strip() or "chat"
+    if len(short) > 42:
+        short = short[:42].rsplit(" ", 1)[0]
+    return f"{today} {label} {short}"
+
+
+def split_csv(value):
+    if not value:
+        return []
+    return [item.strip() for item in value.split(",") if item.strip()]
+
+
+def parse_args(argv):
+    args = {
+        "host": "",
+        "model": "",
+        "conversation": "",
+        "transcript": "",
+        "workspace": "",
+        "configs": [],
+        "conflicts": "",
+        "prefixes": [],
+        "manual": False,
+        "hook": "",
+    }
+    index = 0
+    while index < len(argv):
+        key = argv[index]
+        def take():
+            nonlocal index
+            index += 1
+            if index >= len(argv):
+                raise SystemExit(f"file-session: missing value for {key}")
+            return argv[index]
+        if key == "--host":
+            args["host"] = take()
+        elif key == "--model":
+            args["model"] = take()
+        elif key == "--conversation":
+            args["conversation"] = take()
+        elif key == "--transcript":
+            args["transcript"] = take()
+        elif key == "--workspace":
+            args["workspace"] = take()
+        elif key == "--configs":
+            args["configs"] = split_csv(take())
+        elif key == "--conflicts":
+            args["conflicts"] = take()
+        elif key == "--prefixes":
+            args["prefixes"] = split_csv(take())
+        elif key == "--manual":
+            args["manual"] = True
+        elif key == "--hook":
+            args["hook"] = take()
+        elif key == "--key-status":
+            print("present" if api_key() else "missing")
+            raise SystemExit(0)
+        index += 1
+    return args
+
+
+def from_hook(args):
+    raw = sys.stdin.read()
+    data = json.loads(raw) if raw.strip() else {}
+    host = args["hook"]
+    if host == "cursor":
+        args["host"] = "cursor"
+    elif host == "claude":
+        args["host"] = "claude"
+    args["conversation"] = args["conversation"] or data.get("conversation_id") or data.get("session_id") or ""
+    args["transcript"] = args["transcript"] or data.get("transcript_path") or os.environ.get("CURSOR_TRANSCRIPT_PATH") or ""
+    args["model"] = args["model"] or data.get("model") or data.get("model_name") or ""
+    roots = data.get("workspace_roots") or []
+    cwd = data.get("cwd") or os.environ.get("CURSOR_PROJECT_DIR") or ""
+    if not args["workspace"]:
+        if roots:
+            args["workspace"] = roots[0]
+        elif cwd:
+            args["workspace"] = cwd
+    return args
+
+
+OFFER_RE = re.compile(
+    r"You keep asking for (.+)\. Save it as a preference or a parameter\?",
+    re.S,
+)
+
+
+def normalize_ask(text):
+    return " ".join(str(text).split()).casefold()
+
+
+def ask_key(text):
+    """Same ask after case and space folding. A trailing period is the offer sentence, not a new ask."""
+    return normalize_ask(text).rstrip(".")
+
+
+def section_asked(text):
+    match = re.search(r"(?m)^## Asked\s*\n(.*?)(?=^## |\Z)", text, re.S)
+    if not match:
+        return ""
+    return match.group(1).strip()
+
+
+def offered_asks(path):
+    """Asks this transcript already offered to save. Empty when there is no file."""
+    if not path or not os.path.isfile(path):
+        return []
+    try:
+        text = read_text(path)
+    except OSError:
+        return []
+    found = []
+    seen = set()
+    for match in OFFER_RE.finditer(text):
+        ask = " ".join(match.group(1).split())
+        key = ask.casefold()
+        if not ask or key in seen:
+            continue
+        seen.add(key)
+        found.append(ask)
+    return found
+
+
+def session_asked_rows():
+    """Asked text already filed, one row per session note."""
+    rows = []
+    for root, dirs, files in os.walk(VAULT):
+        dirs[:] = [name for name in dirs if name not in (".git", "Skill files", "_Scripts", "_Templates", "_Config")]
+        if os.path.basename(root) != "Sessions":
+            continue
+        for name in files:
+            if not name.endswith(".md"):
+                continue
+            path = os.path.join(root, name)
+            try:
+                text = read_text(path)
+            except OSError:
+                continue
+            conversation = frontmatter_value(text, "conversation")
+            asked = section_asked(text)
+            key = ask_key(asked)
+            if not conversation or not key or key == "transcript unavailable":
+                continue
+            rows.append({
+                "conversation": conversation,
+                "key": key,
+                "asked": " ".join(asked.split()),
+            })
+    return rows
+
+
+def repeat_entries(asked, conversation, offers):
+    """Repeats for the note being filed. Older notes are left as they are."""
+    by_norm = {}
+    for row in session_asked_rows():
+        if row["conversation"] == conversation:
+            continue
+        by_norm.setdefault(row["key"], set()).add(row["conversation"])
+    offer_keys = {ask_key(item) for item in offers}
+    entries = []
+    seen = set()
+
+    def add(ask, offered):
+        key = ask_key(ask)
+        if not key or key == "transcript unavailable" or key in seen:
+            return
+        seen.add(key)
+        chats = len(by_norm.get(key, set()))
+        if key == ask_key(asked):
+            chats += 1
+        if chats < 2 and not offered:
+            return
+        item = {"ask": " ".join(str(ask).split()), "chats": chats}
+        if offered:
+            item["offered"] = True
+        entries.append(item)
+
+    if asked:
+        add(asked, ask_key(asked) in offer_keys)
+    for ask in offers:
+        add(ask, True)
+    return entries
+
+
+def read_sources():
+    """Step 1. The filer reads the same notes the chat model reads."""
+    names = (
+        "Prefixes.md",
+        "Hosts.md",
+        "_Templates/Session.md",
+        "How this vault works.md",
+        "Parameters.md",
+    )
+    missing = [name for name in names if not os.path.isfile(os.path.join(VAULT, name))]
+    if missing:
+        return False
+    for name in names:
+        read_text(os.path.join(VAULT, name))
+    # Preferences is optional. A missing or unreadable note does not stop filing.
+    prefs = os.path.join(VAULT, "Preferences.md")
+    if os.path.isfile(prefs):
+        try:
+            read_text(prefs)
+        except OSError:
+            pass
+    return True
+
+
+def file_session(args):
+    if not os.path.isdir(VAULT) or not read_sources():
+        print("file-session: vault unreadable", file=sys.stderr)
+        return 1
+    host = (args["host"] or "unknown").strip().lower()
+    if host not in PROFILES:
+        host = "unknown"
+    params = parameters()
+    transcript_path = args["transcript"]
+    events = []
+    readable = bool(transcript_path) and os.path.isfile(transcript_path)
+    if readable:
+        try:
+            events = load_events(transcript_path)
+        except OSError:
+            readable = False
+    messages = user_messages(events) if readable else []
+    turns = len(messages)
+    changed = has_changes(events) if readable else False
+    prefixes = list(args["prefixes"])
+    for phrase in typed_prefixes(messages):
+        if phrase not in prefixes:
+            prefixes.append(phrase)
+    # The offer is in the assistant's reply, so it is read from the transcript.
+    offers = offered_asks(transcript_path)
+    # Short chats with nothing on disk are skipped. A typed prefix is exempt.
+    # A silent start never appears in the transcript, so it does not count.
+    # A missing transcript is not a short chat: it still gets the minimal note.
+    # A chat that offered to save an ask is filed so offered can be recorded.
+    if (
+        readable
+        and not args["manual"]
+        and turns < params["min_turns"]
+        and params["skip_if_no_changes"]
+        and not changed
+        and not prefixes
+        and not offers
+    ):
+        return 0
+    conversation = args["conversation"] or fallback_id(host, messages[0] if messages else host)
+    existing = find_note(conversation)
+    kept_conflicts = args["conflicts"]
+    if existing:
+        previous = read_text(existing)
+        front = previous.split("---", 2)[1] if previous.startswith("---") else ""
+        if "host:" not in front:
+            return 0
+        if not kept_conflicts:
+            kept_conflicts = frontmatter_value(previous, "conflicts")
+        filed = frontmatter_value(previous, "filed_turns")
+        try:
+            filed_turns = int(filed) if filed else 0
+        except ValueError:
+            filed_turns = 0
+        if not args["manual"] and turns - filed_turns < params["refile_min_new_turns"]:
+            return 0
+    today = datetime.date.today().isoformat()
+    if host in WEB_HOSTS:
+        home = chats_home()
+    else:
+        home = project_from_ticket(messages) or project_from_workspace(args["workspace"]) or chats_home()
+    if home is None:
+        print("file-session: Chats home is missing", file=sys.stderr)
+        return 1
+    model = args["model"] or (model_from_events(events) if readable else "") or "unknown"
+    profile = PROFILES[host]
+    model_name = (params.get("filer_model") or "").strip()
+    if readable:
+        def caller():
+            excerpt = "\n".join(messages)
+            if not excerpt.strip():
+                return None
+            return call_model(model_name, excerpt, params["filer_cost_cap_usd"])
+
+        key = api_key() if model_name else ""
+        card = select_card(messages, events, home["name"], model_name, key, caller)
+    else:
+        print("file-session: transcript unavailable", file=sys.stderr)
+        card = minimal_card(host, today)
+    label = home["name"]
+    title = short_title(card["title"], label, today)
+    if existing:
+        title = os.path.splitext(os.path.basename(existing))[0]
+    tags = ["session", "temporal", home["area"]]
+    slug = project_slug(home["name"])
+    if slug and slug != home["area"]:
+        tags.append(slug)
+    if is_private(home):
+        tags.append("private")
+    tags.extend(provenance_tags(host, model))
+    fields = {
+        "date": today,
+        "host": host,
+        "model": model,
+        "profile": profile,
+        "conversation": conversation,
+        "transcript": transcript_path or "",
+        "truncated": bool(card.get("truncated")),
+        "filer": card.get("filer") or "local",
+        "filer_error": card.get("filer_error") or "",
+        "configs_read": args["configs"],
+        "conflicts": kept_conflicts,
+        "prefixes": prefixes,
+        "repeats": repeat_entries(card.get("asked") or "", conversation, offers),
+        "filed_turns": turns,
+        "tags": tags,
+        "project": home["name"],
+    }
+    note = render_note(fields, title, card["asked"], card["changed"])
+    if existing:
+        path = existing
+    else:
+        folder = os.path.join(VAULT, home["folder"])
+        os.makedirs(folder, exist_ok=True)
+        path = os.path.join(folder, title + ".md")
+        number = 2
+        while os.path.exists(path):
+            path = os.path.join(folder, f"{title} {number}.md")
+            number += 1
+        title = os.path.splitext(os.path.basename(path))[0]
+        note = render_note(fields, title, card["asked"], card["changed"])
+    write_text(path, note)
+    ensure_index(home, title)
+    if changed:
+        upsert_daily(home, today, title, conversation)
+    refresh_snapshot(host)
+    refresh_views()
+    return 0
+
+
+def main(argv):
+    args = parse_args(argv)
+    if args["hook"]:
+        args = from_hook(args)
+    if not args["host"] and not args["hook"]:
+        print("file-session: host is required", file=sys.stderr)
+        return 1
+    return file_session(args)
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv[1:]))
+    except BrokenPipeError:
+        sys.exit(0)
+    except Exception as error:
+        print(f"file-session: {error}", file=sys.stderr)
+        sys.exit(1)

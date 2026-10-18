@@ -1,0 +1,32 @@
+name: Report
+description: A bug, an idea, or a conduct report. Security problems go through private vulnerability reporting instead.
+body:
+  - type: dropdown
+    id: kind
+    attributes:
+      label: Type
+      options:
+        - Bug
+        - Idea
+        - Conduct
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened, or what you want
+      description: Use example names only. Do not paste notes, paths, keys, or anything from your Workspace map.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps or context
+      description: The phrase you said, the host, and the reply you got.
+  - type: checkboxes
+    id: private
+    attributes:
+      label: Privacy
+      options:
+        - label: This report has no personal data in it.
+          required: true

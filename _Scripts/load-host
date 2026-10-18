@@ -1,0 +1,760 @@
+#!/usr/bin/env python3
+"""Restore missing personal files for one host, and list matching session cards.
+
+Writes only on an allowlist under the home directory, and only when a file
+is missing. Snapshots live in _Scripts/host-restore/ and stay inside the vault.
+"""
+import argparse
+import json
+import os
+import re
+import shutil
+import sys
+from pathlib import Path
+
+VAULT = Path(os.path.realpath(os.path.expanduser(os.environ.get("BRAIN_VAULT", "~/Documents/Brain"))))
+HOSTS = ("claude-ai", "chatgpt", "gemini", "cursor", "claude", "codex")
+WEB = {"chatgpt", "claude-ai", "gemini"}
+PAYLOAD_HOSTS = ("claude", "cursor")
+PROFILES = {
+    "claude": "Hosts/Claude.md",
+    "cursor": "Hosts/Cursor.md",
+    "codex": "Hosts/Codex.md",
+    "chatgpt": "Hosts/Web.md",
+    "claude-ai": "Hosts/Web.md",
+    "gemini": "Hosts/Web.md",
+}
+SKILL_HUBS = {
+    "cursor": "Skills/Cursor/Cursor skills.md",
+    "claude": "Skills/Claude/Claude skills.md",
+    "codex": "Skills/Codex/Codex skills.md",
+}
+DOTDIR = {"cursor": ".cursor", "claude": ".claude", "codex": ".codex"}
+SKIP_WALK = {".git", ".obsidian", "Skill files", "host-restore", "node_modules", "_Scripts", "_Templates", "_Config"}
+LINK = re.compile(r"`([^`]*/\.(cursor|claude|codex)/skills/([^`/]+))` links to this master")
+PROJECT_LINK = re.compile(r"^Project:\s*\[\[(.+?)\]\]", re.M)
+
+THIN_HOOK = """#!/usr/bin/env python3
+\"\"\"{kind} hook. Calls the shared filer. Does not remind.\"\"\"
+import os
+import subprocess
+import sys
+
+FILER = os.path.expanduser("~/Documents/Brain/_Scripts/file-session")
+
+
+def main():
+    raw = sys.stdin.read()
+    if not os.path.isfile(FILER):
+        print("file-session: vault unreadable", file=sys.stderr)
+        return 1
+    completed = subprocess.run(
+        [sys.executable, FILER, "--hook", "{hook}"],
+        input=raw,
+        text=True,
+    )
+    return completed.returncode
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except Exception as error:
+        print(f"file-session: {{error}}", file=sys.stderr)
+        sys.exit(1)
+"""
+
+CURSOR_HOOKS = {
+    "version": 1,
+    "hooks": {
+        "stop": [
+            {
+                "command": "python3 -I ./hooks/brain-reminder.py",
+                "timeout": 45,
+                "loop_limit": 1,
+            }
+        ],
+        "sessionEnd": [
+            {
+                "command": "python3 -I ./hooks/brain-reminder.py",
+                "timeout": 45,
+            }
+        ],
+    },
+}
+
+CLAUDE_HOOK_ENTRY = {
+    "hooks": [
+        {
+            "type": "command",
+            "command": "python3 -I ~/.claude/hooks/brain-reminder.py",
+            "timeout": 45,
+        }
+    ]
+}
+
+
+def home_dir(arg):
+    raw = arg or os.environ.get("BRAIN_HOME") or str(Path.home())
+    return Path(os.path.realpath(os.path.expanduser(raw)))
+
+
+def snap_root(host):
+    path = (VAULT / "_Scripts" / "host-restore" / host).resolve()
+    root = (VAULT / "_Scripts" / "host-restore").resolve()
+    if path != root and not str(path).startswith(str(root) + os.sep):
+        raise SystemExit("load-host: refused to write outside _Scripts/host-restore")
+    return path
+
+
+def load_sessions_cap():
+    path = VAULT / "Parameters.md"
+    if not path.is_file():
+        return 5
+    for line in path.read_text(errors="ignore").splitlines():
+        match = re.match(r"^load_sessions:\s*(\d+)\s*$", line)
+        if match:
+            return int(match.group(1))
+    return 5
+
+
+def brain_block():
+    web = VAULT / "Hosts" / "Web.md"
+    if web.is_file():
+        text = web.read_text(errors="ignore")
+        start = text.find("<!-- brain:start -->")
+        end = text.find("<!-- brain:end -->")
+        if start != -1 and end != -1 and end > start:
+            return text[start:end + len("<!-- brain:end -->")].strip() + "\n"
+    return ""
+
+
+def thin_hook(hook):
+    kind = "Stop" if hook == "cursor" else "Session-end"
+    return THIN_HOOK.format(kind=kind, hook=hook)
+
+
+def display(path, home):
+    try:
+        rel = path.resolve().relative_to(home.resolve())
+    except ValueError:
+        try:
+            rel = Path(path).relative_to(home)
+        except ValueError:
+            return str(path)
+    return "~/" + rel.as_posix()
+
+
+def inside(path, root):
+    real_root = root.resolve()
+    try:
+        path.resolve().relative_to(real_root)
+        return True
+    except (ValueError, OSError):
+        return False
+
+
+def allowed_file(path, home):
+    """Personal host files this script may create. Never a repo or a cache."""
+    try:
+        rel = Path(os.path.abspath(path)).relative_to(Path(os.path.abspath(home)))
+    except ValueError:
+        return False
+    parts = rel.parts
+    if len(parts) == 2 and parts[0] == ".claude" and parts[1] in ("CLAUDE.md", "settings.json"):
+        return True
+    if parts[:3] == (".claude", "hooks", "brain-reminder.py"):
+        return True
+    if parts[:2] == (".cursor", "hooks.json") and len(parts) == 2:
+        return True
+    if parts[:3] == (".cursor", "hooks", "brain-reminder.py"):
+        return True
+    if len(parts) == 3 and parts[0] in (".claude", ".cursor", ".codex") and parts[1] == "skills":
+        name = parts[2]
+        if name in ("synced",) or name.startswith(".") or name == "skills-cursor":
+            return False
+        return True
+    return False
+
+
+def ensure_parent(path, home):
+    parent = path.parent
+    if not allowed_file(path, home):
+        raise SystemExit(f"load-host: refused {path}")
+    # The parent of an allowlisted file is the host config dir or its hooks/skills dir.
+    parent.mkdir(parents=True, exist_ok=True)
+
+
+def read_front(path):
+    try:
+        text = path.read_text(errors="ignore")
+    except OSError:
+        return "", ""
+    if not text.startswith("---"):
+        return "", text
+    parts = text.split("---", 2)
+    if len(parts) < 3:
+        return "", text
+    return parts[1], parts[2]
+
+
+def field(front, key):
+    match = re.search(rf"^{key}:\s*(.+)$", front, re.M)
+    if not match:
+        return ""
+    return match.group(1).strip().strip("\"'")
+
+
+def tags_of(front):
+    match = re.search(r"^tags:\s*\[(.*)\]", front, re.M)
+    if not match:
+        return []
+    return [part.strip() for part in match.group(1).split(",") if part.strip()]
+
+
+def slug(name):
+    return re.sub(r"\s+", "-", name.strip().casefold())
+
+
+def walk_notes():
+    for dirpath, dirnames, filenames in os.walk(VAULT):
+        dirnames[:] = [name for name in dirnames if name not in SKIP_WALK and not name.startswith(".")]
+        for name in filenames:
+            if name.endswith(".md"):
+                yield Path(dirpath) / name
+
+
+def project_notes():
+    found = []
+    templates = (VAULT / "_Templates").resolve()
+    for path in walk_notes():
+        try:
+            if templates in path.resolve().parents:
+                continue
+        except OSError:
+            continue
+        front, _body = read_front(path)
+        if "project" not in tags_of(front):
+            continue
+        title = path.stem
+        found.append({
+            "title": title,
+            "slug": slug(title),
+            "path": path,
+            "folder": path.parent,
+        })
+    return found
+
+
+def match_projects(name, notes):
+    key = name.strip().casefold()
+    wanted = slug(name)
+    hits = []
+    for note in notes:
+        if key == note["title"].casefold() or key == note["slug"] or wanted == note["slug"]:
+            hits.append(note)
+    # One note can match twice. Keep unique paths.
+    unique = []
+    seen = set()
+    for note in hits:
+        if note["path"] not in seen:
+            seen.add(note["path"])
+            unique.append(note)
+    return unique
+
+
+def company_dir(name):
+    work = VAULT / "Work"
+    if not work.is_dir():
+        return None
+    key = name.strip().casefold()
+    wanted = slug(name)
+    for child in work.iterdir():
+        if not child.is_dir() or child.name.startswith("."):
+            continue
+        if key == child.name.casefold() or wanted == slug(child.name):
+            return child
+    return None
+
+
+def session_matches(path, front, body, host, scope):
+    if field(front, "host").casefold() != host:
+        return False
+    if "session" not in tags_of(front):
+        return False
+    kind, value = scope
+    if kind in ("host", "all"):
+        return True
+    if kind == "project":
+        note = value
+        try:
+            inside_project = note["folder"].resolve() in path.resolve().parents or path.resolve().parent == note["folder"].resolve()
+        except OSError:
+            inside_project = False
+        if inside_project or str(path.resolve()).startswith(str(note["folder"].resolve()) + os.sep):
+            return True
+        if note["slug"] in tags_of(front):
+            return True
+        link = PROJECT_LINK.search(body or "")
+        return bool(link and link.group(1).casefold() == note["title"].casefold())
+    if kind == "company":
+        folder = value
+        try:
+            under = str(path.resolve()).startswith(str(folder.resolve()) + os.sep)
+        except OSError:
+            under = False
+        return under or slug(folder.name) in tags_of(front)
+    return False
+
+
+def collect_sessions(host, scope, cap):
+    rows = []
+    for path in walk_notes():
+        front, body = read_front(path)
+        if not session_matches(path, front, body, host, scope):
+            continue
+        rows.append({
+            "path": path,
+            "date": field(front, "date"),
+            "mtime": path.stat().st_mtime if path.exists() else 0,
+        })
+    rows.sort(key=lambda row: (row["date"], row["mtime"]), reverse=True)
+    total = len(rows)
+    shown = rows[:cap]
+    through = shown[0]["date"] if shown else ""
+    return shown, total, through
+
+
+def copy_bytes(src, dest):
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_bytes(src.read_bytes())
+
+
+def snapshot_host(host, home):
+    if host not in PAYLOAD_HOSTS:
+        print(f"snapshot: {host} none", file=sys.stderr)
+        return 0
+    folder = snap_root(host)
+    folder.mkdir(parents=True, exist_ok=True)
+    if host == "claude":
+        claude = home / ".claude"
+        for name in ("CLAUDE.md", "settings.json"):
+            src = claude / name
+            if src.is_file() and src.stat().st_size > 0:
+                if name.endswith(".json"):
+                    try:
+                        json.loads(src.read_text(errors="ignore"))
+                    except json.JSONDecodeError:
+                        print(f"snapshot: left {display(src, home)} (broken)", file=sys.stderr)
+                        continue
+                copy_bytes(src, folder / name)
+                print(f"snapshot: {name}", file=sys.stderr)
+        hook = folder / "hooks"
+        hook.mkdir(parents=True, exist_ok=True)
+        (hook / "brain-reminder.py").write_text(thin_hook("claude"))
+        print("snapshot: hooks/brain-reminder.py", file=sys.stderr)
+    if host == "cursor":
+        hooks_json = home / ".cursor" / "hooks.json"
+        dest = folder / "hooks.json"
+        wrote = False
+        if hooks_json.is_file() and hooks_json.stat().st_size > 0:
+            try:
+                json.loads(hooks_json.read_text(errors="ignore"))
+            except json.JSONDecodeError:
+                print(f"snapshot: left {display(hooks_json, home)} (broken)", file=sys.stderr)
+            else:
+                copy_bytes(hooks_json, dest)
+                wrote = True
+                print("snapshot: hooks.json", file=sys.stderr)
+        if not wrote and not dest.is_file():
+            dest.write_text(json.dumps(CURSOR_HOOKS, indent=2) + "\n")
+            print("snapshot: hooks.json (thin)", file=sys.stderr)
+        hook = folder / "hooks"
+        hook.mkdir(parents=True, exist_ok=True)
+        (hook / "brain-reminder.py").write_text(thin_hook("cursor"))
+        print("snapshot: hooks/brain-reminder.py", file=sys.stderr)
+    return 0
+
+
+def file_state(path):
+    if path.is_symlink() and not path.exists():
+        return "dangling"
+    if not path.exists() and not path.is_symlink():
+        return "missing"
+    try:
+        size = path.stat().st_size
+    except OSError:
+        return "broken"
+    if size == 0:
+        return "empty"
+    if path.suffix == ".json" or path.name == "hooks.json" or path.name == "settings.json":
+        try:
+            json.loads(path.read_text(errors="ignore"))
+        except json.JSONDecodeError:
+            return "broken"
+    return "present"
+
+
+def write_new(path, data, home):
+    ensure_parent(path, home)
+    if isinstance(data, bytes):
+        path.write_bytes(data)
+    else:
+        path.write_text(data)
+
+
+def commands_have_hook(obj):
+    blob = json.dumps(obj)
+    return "brain-reminder.py" in blob
+
+
+def merge_json(path, mutate, home, restored, reported, left):
+    state = file_state(path)
+    label = display(path, home)
+    if state == "missing":
+        return False
+    if state in ("empty", "broken", "dangling"):
+        reported.append(f"{label} {state}")
+        return True
+    try:
+        data = json.loads(path.read_text(errors="ignore"))
+    except json.JSONDecodeError:
+        reported.append(f"{label} broken")
+        return True
+    if not isinstance(data, dict):
+        reported.append(f"{label} broken")
+        return True
+    if commands_have_hook(data):
+        left.append(label)
+        return True
+    mutate(data)
+    ensure_parent(path, home)
+    path.write_text(json.dumps(data, indent=2) + "\n")
+    restored.append(label)
+    return True
+
+
+def restore_from_snapshot(path, snap, fallback, home, restored, reported, left):
+    label = display(path, home)
+    state = file_state(path)
+    if state == "dangling":
+        path.unlink()
+        state = "missing"
+    if state in ("empty", "broken"):
+        reported.append(f"{label} {state}")
+        return
+    if state == "present":
+        left.append(label)
+        return
+    if snap is not None and snap.is_file() and snap.stat().st_size > 0:
+        write_new(path, snap.read_bytes(), home)
+        restored.append(label)
+        return
+    if fallback is not None:
+        write_new(path, fallback, home)
+        restored.append(label)
+        return
+    reported.append(f"{label} no snapshot")
+
+
+def add_claude_hook(data):
+    hooks = data.setdefault("hooks", {})
+    if not isinstance(hooks, dict):
+        data["hooks"] = {}
+        hooks = data["hooks"]
+    session_end = hooks.setdefault("SessionEnd", [])
+    if not isinstance(session_end, list):
+        hooks["SessionEnd"] = []
+        session_end = hooks["SessionEnd"]
+    session_end.append(CLAUDE_HOOK_ENTRY)
+
+
+def add_cursor_hook(data):
+    hooks = data.setdefault("hooks", {})
+    if not isinstance(hooks, dict):
+        data["hooks"] = {}
+        hooks = data["hooks"]
+    stop = hooks.setdefault("stop", [])
+    end = hooks.setdefault("sessionEnd", [])
+    if not isinstance(stop, list):
+        hooks["stop"] = []
+        stop = hooks["stop"]
+    if not isinstance(end, list):
+        hooks["sessionEnd"] = []
+        end = hooks["sessionEnd"]
+    stop.append({"command": "python3 -I ./hooks/brain-reminder.py", "timeout": 45, "loop_limit": 1})
+    end.append({"command": "python3 -I ./hooks/brain-reminder.py", "timeout": 45})
+
+
+def append_brain_block(path, home, restored, reported, left):
+    label = display(path, home)
+    state = file_state(path)
+    if state == "missing":
+        block = brain_block()
+        snap = snap_root("claude") / "CLAUDE.md"
+        if snap.is_file() and snap.stat().st_size > 0:
+            write_new(path, snap.read_bytes(), home)
+            restored.append(label)
+        elif block:
+            write_new(path, block, home)
+            restored.append(label)
+        else:
+            reported.append(f"{label} no snapshot")
+        return
+    if state in ("empty", "broken", "dangling"):
+        reported.append(f"{label} {state}")
+        return
+    text = path.read_text(errors="ignore")
+    if "<!-- brain:start -->" in text:
+        left.append(label)
+        return
+    block = brain_block()
+    if not block:
+        reported.append(f"{label} no brain block")
+        return
+    if text and not text.endswith("\n"):
+        text += "\n"
+    path.write_text(text + "\n" + block)
+    restored.append(label)
+
+
+def restore_skills(host, home, restored, reported, left, copied):
+    dot = DOTDIR.get(host)
+    if not dot:
+        return
+    skills = VAULT / "Skills"
+    if not skills.is_dir():
+        return
+    seen = set()
+    for path in skills.glob("*.md"):
+        text = path.read_text(errors="ignore")
+        front, _body = read_front(path)
+        source = field(front, "source")
+        for match in LINK.finditer(text):
+            full, app, name = match.group(1), match.group(2), match.group(3)
+            if app != dot[1:]:
+                continue
+            if name.startswith(".") or "/.system/" in full or "/synced/" in full or "skills-cursor" in full:
+                continue
+            if name in seen:
+                continue
+            seen.add(name)
+            link = home / dot / "skills" / name
+            if not allowed_file(link, home):
+                continue
+            label = display(link, home)
+            if link.is_symlink() and not link.exists():
+                link.unlink()
+            elif link.exists() or link.is_symlink():
+                left.append(label)
+                continue
+            master = Path(os.path.expanduser(source)) if source else None
+            if master is None or master.name != "SKILL.md" or not master.is_file():
+                reported.append(f"{label} no master")
+                continue
+            if not inside(master, VAULT / "Skill files"):
+                reported.append(f"{label} no master")
+                continue
+            target = master.parent
+            try:
+                ensure_parent(link, home)
+                link.symlink_to(target, target_is_directory=True)
+                restored.append(label)
+            except OSError:
+                try:
+                    shutil.copytree(target, link)
+                    copied.append(label)
+                except OSError as error:
+                    reported.append(f"{label} {error}")
+
+
+def restore_host(host, home):
+    restored, reported, left, copied = [], [], [], []
+    paste_rule = False
+    if host in WEB:
+        return restored, reported, left, copied, paste_rule
+    snap = snap_root(host)
+    if host == "claude":
+        append_brain_block(home / ".claude" / "CLAUDE.md", home, restored, reported, left)
+        settings = home / ".claude" / "settings.json"
+        if not merge_json(settings, add_claude_hook, home, restored, reported, left):
+            restore_from_snapshot(settings, snap / "settings.json", None, home, restored, reported, left)
+        restore_from_snapshot(
+            home / ".claude" / "hooks" / "brain-reminder.py",
+            snap / "hooks" / "brain-reminder.py",
+            thin_hook("claude"),
+            home,
+            restored,
+            reported,
+            left,
+        )
+    elif host == "cursor":
+        hooks_json = home / ".cursor" / "hooks.json"
+        if not merge_json(hooks_json, add_cursor_hook, home, restored, reported, left):
+            fallback = json.dumps(CURSOR_HOOKS, indent=2) + "\n"
+            restore_from_snapshot(hooks_json, snap / "hooks.json", fallback, home, restored, reported, left)
+        hook = home / ".cursor" / "hooks" / "brain-reminder.py"
+        before = file_state(hook)
+        restore_from_snapshot(
+            hook,
+            snap / "hooks" / "brain-reminder.py",
+            thin_hook("cursor"),
+            home,
+            restored,
+            reported,
+            left,
+        )
+        if before == "missing" or (hook.is_symlink() and before == "dangling"):
+            paste_rule = display(hook, home) in restored or file_state(hook) == "present" and before != "present"
+        if any(item.endswith("hooks/brain-reminder.py") or item.endswith("brain-reminder.py") for item in restored):
+            paste_rule = True
+    restore_skills(host, home, restored, reported, left, copied)
+    return restored, reported, left, copied, paste_rule
+
+
+def scope_label(kind, raw):
+    if kind == "project":
+        return f"project: {raw}"
+    if kind == "company":
+        return f"company: {raw}"
+    if kind == "all":
+        return "all"
+    return ""
+
+
+def reply(host, label, shown, total, through, restored, copied, reported, no_match, several, paste_rule):
+    bracket = f" [{label}]" if label else ""
+    if several:
+        names = ", ".join(note["title"] for note in several)
+        return f"Loaded {host}{bracket}: 0 sessions. Matches: {names}."
+    if no_match:
+        return f"Loaded {host}{bracket}: 0 sessions. No match."
+    count = f"{shown} of {total} sessions"
+    if through:
+        count += f" through {through}"
+    names = list(restored) + [f"{item} copied" for item in copied]
+    if names:
+        tail = "Restored: " + ", ".join(names) + "."
+    else:
+        tail = "Nothing to restore."
+    if reported:
+        tail += " Reported: " + ", ".join(reported) + "."
+    if paste_rule:
+        tail += " Paste the brain block from Hosts/Web.md into the Cursor user rule."
+    return f"Loaded {host}{bracket}: {count}. {tail}"
+
+
+def main(argv):
+    parser = argparse.ArgumentParser(description="Load one wiped host from the vault")
+    parser.add_argument("host", nargs="?")
+    parser.add_argument("--snapshot", action="store_true")
+    parser.add_argument("--project")
+    parser.add_argument("--company")
+    parser.add_argument("--all", dest="all_scope", action="store_true")
+    parser.add_argument("--home")
+    args = parser.parse_args(argv)
+    home = home_dir(args.home)
+    if not VAULT.is_dir():
+        host = (args.host or "unknown").casefold()
+        print(f"Brain unavailable: {host}")
+        return 1
+    if args.snapshot:
+        targets = [args.host.casefold()] if args.host else list(PAYLOAD_HOSTS)
+        for host in targets:
+            if host not in HOSTS and host not in PAYLOAD_HOSTS:
+                print("Which host? cursor, claude, codex, chatgpt, claude-ai, or gemini.")
+                return 2
+            snapshot_host(host, home)
+        return 0
+    if not args.host:
+        print("Which host? cursor, claude, codex, chatgpt, claude-ai, or gemini.")
+        return 2
+    host = args.host.casefold()
+    if host not in HOSTS:
+        print("Which host? cursor, claude, codex, chatgpt, claude-ai, or gemini.")
+        return 2
+    chosen = [bool(args.project), bool(args.company), bool(args.all_scope)]
+    if sum(chosen) > 1:
+        print("load-host: use one of project, company, or all")
+        return 1
+    scope = ("host", None)
+    label = ""
+    no_match = False
+    several = []
+    project_note = None
+    company = None
+    if args.all_scope:
+        scope = ("all", None)
+        label = "all"
+    elif args.project:
+        hits = match_projects(args.project, project_notes())
+        label = scope_label("project", args.project.strip())
+        if len(hits) > 1:
+            several = hits
+        elif len(hits) == 1:
+            project_note = hits[0]
+            scope = ("project", project_note)
+        else:
+            no_match = True
+    elif args.company:
+        company = company_dir(args.company)
+        label = scope_label("company", args.company.strip())
+        if company is None:
+            no_match = True
+        else:
+            scope = ("company", company)
+    cap = load_sessions_cap()
+    shown, total, through = ([], 0, "")
+    if not no_match and not several:
+        shown, total, through = collect_sessions(host, scope, cap)
+    restored, reported, left, copied, paste_rule = restore_host(host, home)
+    print(f"host: {host}")
+    if label:
+        print(f"scope: {label}")
+    print(f"shown: {len(shown)}")
+    print(f"total: {total}")
+    if through:
+        print(f"through: {through}")
+    print("read:")
+    profile = PROFILES[host]
+    print(f"- {profile}")
+    print("- Parameters.md")
+    hub = SKILL_HUBS.get(host)
+    if hub:
+        print(f"- {hub}")
+    if project_note:
+        print(f"- {project_note['path'].relative_to(VAULT)}")
+    if company is not None:
+        params = company / f"{company.name} Parameters.md"
+        if params.is_file():
+            print(f"- {params.relative_to(VAULT)}")
+    print("sessions:")
+    for row in shown:
+        print(f"- {row['path']}")
+    print("restored:")
+    for item in restored:
+        print(f"- {item}")
+    print("copied:")
+    for item in copied:
+        print(f"- {item}")
+    print("left:")
+    for item in left:
+        print(f"- {item}")
+    print("reported:")
+    for item in reported:
+        print(f"- {item}")
+    if host in WEB:
+        print("paste: Hosts/Web.md")
+    line = reply(host, label, len(shown), total, through, restored, copied, reported, no_match, several, paste_rule)
+    print(f"reply: {line}")
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv[1:]))
+    except BrokenPipeError:
+        sys.exit(0)
+    except Exception as error:
+        print(f"load-host: {error}", file=sys.stderr)
+        sys.exit(1)

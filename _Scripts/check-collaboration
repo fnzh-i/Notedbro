@@ -1,0 +1,70 @@
+#!/usr/bin/env python3
+"""Check collaboration routing and filing in an isolated temporary vault."""
+import contextlib
+import io
+import os
+from pathlib import Path
+import tempfile
+import types
+
+SCRIPT = Path(__file__).with_name('file-session')
+mod = types.ModuleType('file_session')
+exec(compile(SCRIPT.read_text(), str(SCRIPT), 'exec'), mod.__dict__)
+with tempfile.TemporaryDirectory() as folder:
+    mod.VAULT = os.path.realpath(folder)
+    root = Path(mod.VAULT)
+    code = root / 'code'
+    for name in ('Prefixes.md', 'Hosts.md', '_Templates/Session.md', 'How this vault works.md', 'Parameters.md'):
+        path = root / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text('')
+    for rel in ('Collaboration/Shared/Shared.md', 'Personal/Chats/Chats.md', 'Personal/Solo/Solo.md', 'Work/Example/Projects/Portal/Portal.md'):
+        path = root / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text('---\ntags: [project]\n---\n')
+    (root / 'Workspace map.md').write_text(
+        '# Workspace map\n\n'
+        '## Company\n- name: Example\n- ticket key: EX\n'
+        f'- workspace: {code / "example"}\n- daily: date only\n\n'
+        '## Workspaces\n| Path | Project | Area |\n|---|---|---|\n'
+        f'| {code / "shared"} | Shared | collaboration |\n'
+    )
+    home = mod.project_from_workspace(str(code / 'shared'))
+    assert home['area'] == 'collaboration'
+    assert home['folder'] == 'Collaboration/Shared/Sessions'
+    assert mod.project_home('Solo')['area'] == 'personal'
+    assert mod.project_from_workspace(str(code / 'shared' / 'app'))['area'] == 'collaboration'
+    portal = mod.project_from_workspace(str(code / 'example' / 'Portal'))
+    assert portal['area'] == 'example'
+    assert Path(mod.daily_path(portal, '2026-01-02')) == root / 'Work/Example/Daily/2026-01-02.md'
+    ticket = root / 'Work/Example/Projects/Portal/Tickets/EX-7.md'
+    ticket.parent.mkdir(parents=True)
+    ticket.write_text('Project: [[Portal]]\n')
+    assert mod.project_from_ticket(['look at ex-7 today'])['name'] == 'Portal'
+    assert mod.project_from_ticket(['look at AB-7 today']) is None
+    assert mod.project_from_workspace('/unrecognised/project') is None
+    args = mod.parse_args(['--host', 'codex', '--model', 'test', '--conversation', 'collab-test', '--workspace', str(code / 'shared'), '--manual'])
+    transcript = root / 'transcript.jsonl'
+    transcript.write_text('')
+    args['transcript'] = str(transcript)
+    # Exercise the full write path, then refile the same conversation.
+    mod.has_changes = lambda events: True
+    with contextlib.redirect_stderr(io.StringIO()):
+        assert mod.file_session(args) == 0
+        assert mod.file_session(args) == 0
+    notes = list((root / home['folder']).glob('*.md'))
+    assert len(notes) == 1
+    text = notes[0].read_text()
+    assert 'collaboration, shared' in text
+    assert 'host/codex, ai/unknown, model/test' in text
+    assert 'Project: [[Shared]]' in text
+    daily = Path(mod.daily_path(home, mod.datetime.date.today().isoformat()))
+    assert daily.parent == root / 'Collaboration/Daily'
+    assert daily.read_text().count('collab-test') == 1
+    assert 'collaboration, shared' in daily.read_text()
+    # Existing web-host policy is preserved.
+    args.update(host='chatgpt', conversation='web-test')
+    with contextlib.redirect_stderr(io.StringIO()):
+        assert mod.file_session(args) == 0
+    assert len(list((root / 'Personal/Chats/Sessions').glob('*.md'))) == 1
+print('check-collaboration: passed (routing, filing, tags, Daily, idempotence, personal/web fallback)')

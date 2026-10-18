@@ -1,0 +1,242 @@
+#!/usr/bin/env python3
+"""Check filer card selection without writing a session note."""
+import email.message
+import os
+import sys
+import types
+import urllib.error
+
+PATH = os.path.join(os.path.dirname(os.path.realpath(__file__)), "file-session")
+mod = types.ModuleType("file_session")
+mod.__file__ = PATH
+with open(PATH) as source:
+    exec(compile(source.read(), PATH, "exec"), mod.__dict__)
+
+
+def fail(message):
+    print(f"check-file-session: {message}", file=sys.stderr)
+    sys.exit(1)
+
+
+def refuse_write(*_args, **_kwargs):
+    fail("tried to write a session note")
+
+
+mod.write_text = refuse_write
+
+
+def fail_if_called():
+    fail("model call was made")
+
+
+def note_fields(filer_error=""):
+    return {
+        "date": "2026-10-16",
+        "host": "cursor",
+        "model": "grok",
+        "profile": "Hosts/Cursor",
+        "conversation": "abc",
+        "transcript": "/tmp/transcript",
+        "truncated": False,
+        "filer": "local",
+        "filer_error": filer_error,
+        "configs_read": [],
+        "conflicts": "",
+        "prefixes": [],
+        "filed_turns": 3,
+        "tags": ["session"],
+        "project": "Chats",
+    }
+
+
+expected = {
+    "gpt-6.1-sol": ["host/codex", "ai/gpt", "model/gpt-6-1-sol"],
+    "o3-mini": ["host/codex", "ai/gpt", "model/o3-mini"],
+    "openai-o3-mini": ["host/codex", "ai/gpt", "model/openai-o3-mini"],
+    "claude-opus-5-5": ["host/codex", "ai/claude", "model/claude-opus-5-5"],
+    "cursor-grok-4.6-medium-fast": ["host/codex", "ai/grok", "model/cursor-grok-4-6-medium-fast"],
+    "gemini-3-pro": ["host/codex", "ai/gemini", "model/gemini-3-pro"],
+    "custom": ["host/codex", "ai/unknown", "model/custom"],
+}
+for model, wanted in expected.items():
+    got = mod.provenance_tags("codex", model)
+    if got != wanted:
+        fail(f"provenance tags for {model!r} were {got!r}")
+if mod.provenance_tags("", "") != ["host/unknown", "ai/unknown", "model/unknown"]:
+    fail("blank provenance was not explicit unknown")
+
+
+blank = mod.parameters_from_text("filer_model:\nmin_turns: 3\nskip_if_no_changes: true\n")
+if blank["filer_model"] != "":
+    fail(f"blank filer_model parsed as {blank['filer_model']!r}")
+if blank["min_turns"] != 3 or blank["skip_if_no_changes"] is not True:
+    fail("blank filer_model line disturbed the other limits")
+
+missing = mod.parameters_from_text("min_turns: 4\n")
+if missing["filer_model"] != "":
+    fail("a missing filer_model line should mean no model")
+
+live = mod.parameters()
+if live["filer_model"] != "":
+    fail(f"Parameters.md filer_model is {live['filer_model']!r}")
+
+longer = mod.clean_request(
+    "Please keep /srv/notes/Brain/Parameters.md in the asked text now sk-notarealsecret"
+)
+if "/srv/notes/Brain/Parameters.md" not in longer:
+    fail("clean_request removed a path")
+if "sk-notarealsecret" in longer:
+    fail("clean_request left a secret")
+
+messages = [mod.clean_request("continue"), longer]
+card = mod.select_card(messages, [], "Chats", "", "unused-key", fail_if_called)
+if card["filer"] != "local" or card.get("filer_error"):
+    fail(f"empty filer_model card was {card.get('filer')!r} {card.get('filer_error')!r}")
+if card["title"] != "Please keep srv notes Brain Parameters":
+    fail(f"title came from the wrong message: {card['title']!r}")
+if card["title"].lower().startswith("continue"):
+    fail("title used the short opener")
+if "/srv/notes/Brain/Parameters.md" not in card["asked"]:
+    fail(f"path missing from Asked: {card['asked']!r}")
+if "sk-notarealsecret" in card["asked"] or card["asked"].lower().startswith("continue"):
+    fail(f"Asked used the wrong text: {card['asked']!r}")
+if card["changed"] != "Nothing on disk":
+    fail(f"unchanged chat reported {card['changed']!r}")
+
+write_events = [{
+    "message": {
+        "content": [{
+            "type": "tool_use",
+            "name": "Write",
+            "input": {"path": "/srv/notes/Brain/Parameters.md"},
+        }],
+    },
+}]
+edited = mod.local_card(["Please update the filer model default now"], write_events, "Chats")
+if "Parameters.md" not in edited["changed"] or edited["changed"] == "Nothing on disk":
+    fail(f"write tool was not named: {edited['changed']!r}")
+
+commit_events = [{
+    "message": {
+        "content": [{
+            "type": "tool_use",
+            "name": "Shell",
+            "input": {"command": "git commit -m hello"},
+        }],
+    },
+}]
+committed = mod.local_card(["Please update the filer model default now"], commit_events, "Chats")
+if committed["changed"] != "Committed":
+    fail(f"commit-only change was {committed['changed']!r}")
+
+short = mod.local_card(["ok", "continue"], [], "")
+if short["title"] != "Chat" or short["asked"] != "ok":
+    fail(f"short-only card was {short['title']!r} / {short['asked']!r}")
+
+no_key = mod.select_card(messages, [], "Chats", "some-model", "", fail_if_called)
+if no_key["filer"] != "local" or no_key.get("filer_error") != "no api key":
+    fail(f"missing key card was {no_key.get('filer')!r} {no_key.get('filer_error')!r}")
+
+plain = mod.render_note(note_fields(), "Title", card["asked"], "Nothing on disk")
+if "filer: local" not in plain or "filer_error" in plain:
+    fail("empty filer_error was written into the note")
+failed_note = mod.render_note(note_fields("model call failed"), "Title", card["asked"], "Nothing on disk")
+if "filer_error: model call failed" not in failed_note:
+    fail("filer_error was omitted from the note")
+
+previous_key = os.environ.get("BRAIN_FILER_API_KEY")
+os.environ["BRAIN_FILER_API_KEY"] = "test-not-a-real-key"
+original_open = mod.urllib.request.urlopen
+
+
+def reject(request, timeout=30):
+    raise urllib.error.HTTPError(
+        getattr(request, "full_url", "https://api.anthropic.com/v1/messages"),
+        400,
+        "model not found",
+        email.message.EmailMessage(),
+        None,
+    )
+
+
+mod.urllib.request.urlopen = reject
+try:
+    rejected_call = mod.call_model("not-a-real-model", longer, 0.05)
+    if rejected_call is not None:
+        fail("a rejected model name returned a card")
+    rejected = mod.select_card(
+        messages,
+        [],
+        "Chats",
+        "not-a-real-model",
+        "test-not-a-real-key",
+        lambda: mod.call_model("not-a-real-model", longer, 0.05),
+    )
+    if rejected["filer"] != "local" or rejected.get("filer_error") != "model call failed":
+        fail(f"rejected model card was {rejected.get('filer')!r} {rejected.get('filer_error')!r}")
+finally:
+    mod.urllib.request.urlopen = original_open
+    if previous_key is None:
+        os.environ.pop("BRAIN_FILER_API_KEY", None)
+    else:
+        os.environ["BRAIN_FILER_API_KEY"] = previous_key
+
+def stored(line):
+    parsed = mod.parse_prefix_line(line)
+    if not parsed:
+        return ""
+    return parsed["phrase"]
+
+
+def expect(line, phrase):
+    got = stored(line)
+    if got != phrase:
+        fail(f"{line!r} stored {got!r}, expected {phrase!r}")
+
+
+expect("fnsh -bp", "fnsh -bp")
+expect("fnsh -pb", "fnsh -bp")
+expect("fnsh -bpp", "fnsh -bp")
+expect("fnsh -bq", "fnsh -b")
+expect("fnsh -bpx!", "")
+expect("fnsh bp", "")
+expect("fnsh brain", "fnsh brain")
+expect("use brain", "fnsh brain")
+expect("fnsh update", "fnsh update")
+expect("fnsh prefs", "fnsh prefs")
+expect("fnsh params", "fnsh params")
+expect("fnsh -u", "fnsh -u")
+expect("fnsh example -bp", "fnsh example -bp")
+dropped = mod.parse_prefix_line("fnsh example -b")
+if not dropped or dropped["phrase"] != "fnsh -b" or dropped["dropped_set"] != "example":
+    fail(f"dropped set was {dropped!r}")
+expect("fnsh load cursor update", "fnsh load cursor")
+if mod.setup_chain("fnsh brain") != "fnsh -b" or mod.setup_chain("fnsh -b") != "fnsh -b":
+    fail("fnsh brain and fnsh -b did not both count as fnsh -b")
+expect("fnsh main -bp", "fnsh -bp")
+expect("fnsh -lb cursor", "fnsh -lb cursor")
+expect("fnsh -bt abc", "fnsh -b")
+expect("fnsh -BP", "fnsh -bp")
+expect("fnsh plan save session-prefixes", "fnsh plan save session-prefixes")
+expect("fnsh plan load session-prefixes extra", "fnsh plan load session-prefixes")
+expect("fnsh Plan Save Session-Prefixes", "fnsh plan save session-prefixes")
+expect("fnsh plan list", "fnsh plan list")
+expect("fnsh plan list extra", "fnsh plan list")
+expect("fnsh plan", "fnsh plan")
+expect("fnsh plan save", "fnsh plan")
+if mod.setup_chain("fnsh plan save session-prefixes") != "":
+    fail("fnsh plan was offered as a setup")
+expect("fnsh check", "fnsh check")
+expect("fnsh check extra", "fnsh check")
+if mod.setup_chain("fnsh check") != "":
+    fail("fnsh check was offered as a setup")
+expect("fnsh publish", "fnsh publish")
+expect("fnsh sync now", "fnsh sync")
+expect("fnsh shadow list", "fnsh shadow")
+expect("fnsh rebuild Cursor", "fnsh rebuild cursor")
+expect("fnsh rebuild nowhere", "fnsh rebuild")
+for line in ("fnsh publish", "fnsh sync", "fnsh rebuild cursor"):
+    if mod.setup_chain(line) != "":
+        fail(f"{line} was offered as a setup")
+
+print("check-file-session: ok")

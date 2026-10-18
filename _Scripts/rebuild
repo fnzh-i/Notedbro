@@ -1,0 +1,233 @@
+#!/usr/bin/env python3
+"""Rebuild missing host and harness files from a clean copy.
+
+Creates only missing files. Overwrites an existing file only with --force,
+after a dated backup outside the vault. Prints a preview before writing.
+Never touches notes or Personal/. A scheduled run only prints the preview.
+"""
+
+import importlib.machinery
+import importlib.util
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+from datetime import datetime
+from pathlib import Path
+
+VAULT = Path(os.path.realpath(os.path.expanduser(os.environ.get("BRAIN_VAULT", "~/Documents/Brain"))))
+PUBLISH = Path(os.path.expanduser(os.environ.get("BRAIN_PUBLISH_DIR", "~/.local/share/brain/publish")))
+BACKUPS = Path(os.path.expanduser(os.environ.get("BRAIN_BACKUP_DIR", "~/.local/share/brain/backups")))
+
+GENERATED = {
+    "AGENTS.md": """# Agents
+
+<!-- generated: fnsh rebuild -->
+
+Start here. Read these in order:
+
+1. `Prerequisites.md`: what this vault needs. Python 3 runs the scripts; the notes work without it.
+2. `Prefixes.md`: every phrase and its exact reply. Treat each row as an instruction. Run the `fnsh brain` row silently at the start of a chat.
+3. Your host file: find your row in `Hosts.md`, then follow its profile in `Hosts/` (`Hosts/Cursor.md`, `Hosts/Claude.md`, `Hosts/Codex.md`, `Hosts/Web.md`, or `Hosts/Unknown.md`).
+
+Then read `How this vault works.md`, `Parameters.md`, and `Preferences.md`. If those cannot be opened, read `_Config/bootstrap.md` instead.
+
+Never commit notes, keys, or `Workspace map.md`. Never edit or remove an existing company or project config; add the brain block next to it, and ask before acting on a conflict.
+""",
+    "CLAUDE.md": "Read AGENTS.md. <!-- generated: fnsh rebuild -->\n",
+}
+BOOTSTRAP = "_Config/bootstrap.md"
+ALIASES = {"chatgpt": "web", "claude-ai": "web", "gemini": "web"}
+USAGE = "fnsh rebuild <host> [--force]. Host is cursor, claude, codex, web, chatgpt, claude-ai, gemini, unknown, or all."
+
+
+def load_script(name):
+    path = Path(__file__).resolve().with_name(name)
+    loader = importlib.machinery.SourceFileLoader(name.replace("-", "_"), str(path))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+def targets(host):
+    files = load_script("check-vault").HOST_FILES
+    host = ALIASES.get(host, host)
+    if host == "all":
+        found = [rel for group in files.values() for rel in group]
+        return found + [BOOTSTRAP]
+    if host not in files:
+        return None
+    return list(files[host])
+
+
+def git_copy(vault, rel):
+    if not (vault / ".git").exists() or not shutil.which("git"):
+        return None
+    result = subprocess.run(["git", "-C", str(vault), "show", f"HEAD:{rel}"], capture_output=True)
+    return result.stdout if result.returncode == 0 else None
+
+
+def clean_copy(vault, rel, publish):
+    if rel in GENERATED:
+        return GENERATED[rel].encode()
+    if rel == BOOTSTRAP:
+        return load_script("build-bootstrap").render(vault).encode()
+    found = git_copy(vault, rel)
+    if found is not None:
+        return found
+    path = publish / rel
+    if path.is_file():
+        return path.read_bytes()
+    return None
+
+
+def safe_target(vault, rel):
+    path = (vault / rel).resolve()
+    root = vault.resolve()
+    if root not in path.parents or Path(rel).parts[0] in ("Personal", "Work", "Collaboration", "Research", "Hackathons", "Plans"):
+        raise SystemExit(f"Refused to rebuild {rel}")
+    return path
+
+
+def plan(vault, host, force, publish):
+    actions = []
+    for rel in targets(host):
+        path = safe_target(vault, rel)
+        want = clean_copy(vault, rel, publish)
+        if want is None:
+            actions.append(("no clean copy", rel, None))
+        elif not path.is_file():
+            actions.append(("create", rel, want))
+        elif path.read_bytes() == want:
+            actions.append(("same", rel, None))
+        elif force:
+            actions.append(("overwrite", rel, want))
+        else:
+            actions.append(("keep", rel, None))
+    return actions
+
+
+def preview(actions):
+    lines = ["Preview:"]
+    for kind, rel, _data in actions:
+        if kind == "keep":
+            lines.append(f"- keep {rel} (differs; --force backs it up and overwrites it)")
+        elif kind == "same":
+            lines.append(f"- keep {rel} (unchanged)")
+        else:
+            lines.append(f"- {kind} {rel}")
+    return lines
+
+
+def rebuild(vault, host, force=False, scheduled=False, publish=PUBLISH, backups=BACKUPS, now=None):
+    host = (host or "").casefold()
+    if targets(host) is None:
+        return USAGE
+    actions = plan(vault, host, force, publish)
+    lines = preview(actions)
+    writes = [action for action in actions if action[0] in ("create", "overwrite")]
+    if scheduled:
+        lines.append("Scheduled run: nothing written.")
+        return "\n".join(lines)
+    if not writes:
+        lines.append("Nothing to rebuild.")
+        return "\n".join(lines)
+    stamp = (now or datetime.now()).strftime("%Y-%m-%d-%H%M%S")
+    done = []
+    for kind, rel, data in writes:
+        path = safe_target(vault, rel)
+        if kind == "overwrite":
+            backup = backups / f"rebuild-{stamp}" / rel
+            backup.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
+            shutil.copy2(path, backup)
+            lines.append(f"Backup: {backup}")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(data)
+        done.append(rel)
+    lines.append("Rebuilt: " + ", ".join(done))
+    return "\n".join(lines)
+
+
+def self_check():
+    checker = load_script("check-vault")
+    source = Path(__file__).resolve().parent.parent
+    with tempfile.TemporaryDirectory() as raw:
+        root = Path(raw)
+        vault = root / "vault"
+        publish = root / "publish"
+        backups = root / "backups"
+        for base in (vault, publish):
+            for rel in ("Hosts/Cursor.md", "Hosts/Claude.md", "Hosts/Codex.md", "Hosts/Web.md", "Hosts/Unknown.md"):
+                target = base / rel
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes((source / rel).read_bytes())
+        for rel, text in GENERATED.items():
+            (vault / rel).write_text(text)
+        (vault / "Personal").mkdir()
+        (vault / "Personal" / "Personal.md").write_text("mine\n")
+
+        if checker.host_problems(vault):
+            raise SystemExit(f"self-check: clean vault reported {checker.host_problems(vault)}")
+        (vault / "Hosts" / "Cursor.md").unlink()
+        reported = checker.host_problems(vault)
+        if reported != ["Hosts/Cursor.md: missing. Run fnsh rebuild cursor"]:
+            raise SystemExit(f"self-check: missing host file reported {reported}")
+
+        scheduled = rebuild(vault, "cursor", scheduled=True, publish=publish, backups=backups)
+        if "- create Hosts/Cursor.md" not in scheduled or (vault / "Hosts" / "Cursor.md").exists():
+            raise SystemExit(f"self-check: scheduled run wrote a file:\n{scheduled}")
+
+        reply = rebuild(vault, "cursor", publish=publish, backups=backups)
+        if not reply.startswith("Preview:") or "Rebuilt: Hosts/Cursor.md" not in reply:
+            raise SystemExit(f"self-check: rebuild reply was:\n{reply}")
+        if (vault / "Hosts" / "Cursor.md").read_bytes() != (publish / "Hosts" / "Cursor.md").read_bytes():
+            raise SystemExit("self-check: rebuilt file differs from the clean copy")
+        if checker.host_problems(vault):
+            raise SystemExit("self-check: problems remain after rebuild")
+
+        edited = GENERATED["CLAUDE.md"] + "my edit\n"
+        (vault / "CLAUDE.md").write_text(edited)
+        kept = rebuild(vault, "claude", publish=publish, backups=backups)
+        if "keep CLAUDE.md (differs" not in kept or (vault / "CLAUDE.md").read_text() != edited:
+            raise SystemExit(f"self-check: an edited file was overwritten without --force:\n{kept}")
+        forced = rebuild(vault, "claude", force=True, publish=publish, backups=backups, now=datetime(2026, 1, 2, 3, 4, 5))
+        backup = backups / "rebuild-2026-01-02-030405" / "CLAUDE.md"
+        if not backup.is_file() or backup.read_text() != edited:
+            raise SystemExit(f"self-check: --force made no backup:\n{forced}")
+        if (vault / "CLAUDE.md").read_text() != GENERATED["CLAUDE.md"]:
+            raise SystemExit("self-check: --force did not overwrite")
+
+        (vault / "Hosts" / "Web.md").write_text("")
+        if "Hosts/Web.md: damaged. Run fnsh rebuild web" not in checker.host_problems(vault):
+            raise SystemExit("self-check: an empty Web profile was not reported")
+        if "keep Hosts/Web.md (differs" not in rebuild(vault, "gemini", publish=publish, backups=backups):
+            raise SystemExit("self-check: gemini did not map to the Web profile")
+
+        if (vault / "Personal" / "Personal.md").read_text() != "mine\n":
+            raise SystemExit("self-check: Personal was touched")
+        try:
+            safe_target(vault, "Personal/Personal.md")
+        except SystemExit:
+            pass
+        else:
+            raise SystemExit("self-check: a Personal path was allowed")
+        if rebuild(vault, "nonsense", publish=publish, backups=backups) != USAGE:
+            raise SystemExit("self-check: unknown host was not refused")
+    print("self-check ok")
+
+
+def main(argv):
+    if argv and argv[0] == "self-check":
+        self_check()
+        return 0
+    words = [word for word in argv if not word.startswith("--")]
+    force = "--force" in argv
+    scheduled = "--scheduled" in argv or os.environ.get("BRAIN_SCHEDULED") == "1"
+    print(rebuild(VAULT, words[0] if words else "", force=force, scheduled=scheduled))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))

@@ -1,0 +1,50 @@
+#!/usr/bin/env python3
+"""Check provenance-tag migration behavior in an isolated vault."""
+
+import importlib.machinery
+import importlib.util
+from pathlib import Path
+import tempfile
+
+
+SCRIPT = Path(__file__).with_name("sync-provenance-tags")
+loader = importlib.machinery.SourceFileLoader("sync_provenance_tags", str(SCRIPT))
+spec = importlib.util.spec_from_loader(loader.name, loader)
+mod = importlib.util.module_from_spec(spec)
+loader.exec_module(mod)
+
+
+with tempfile.TemporaryDirectory() as folder, tempfile.TemporaryDirectory() as backup_folder:
+    root = Path(folder)
+    session = root / "Personal/Chats/Sessions/card.md"
+    plan = root / "Plans/example.md"
+    template = root / "_Templates/Session.md"
+    for path in (session, plan, template):
+        path.parent.mkdir(parents=True, exist_ok=True)
+    session_body = "\n".join(["payload"] * 20000)
+    session.write_text(
+        "---\nhost: cursor\nmodel: cursor-grok-4.6-medium-fast\n"
+        "tags: [session, personal, host/old, ai/gpt, model/old]\n---\n" + session_body
+    )
+    plan.write_text("---\ntags: [plan]\nhost: unknown\nmodel: grok-bot\n---\n# Plan\n")
+    template.write_text("---\ntags: [session, host/<host>]\nhost:\nmodel:\n---\n")
+    changes, errors = mod.scan(root)
+    assert not errors
+    assert len(changes) == 2
+    backup = Path(backup_folder)
+    mod.apply_changes(changes, root, backup)
+    result = session.read_text()
+    assert "tags: [session, personal, host/cursor, ai/grok, model/cursor-grok-4-6-medium-fast]" in result
+    assert result.endswith(session_body)
+    assert "tags: [plan, host/unknown, ai/grok, model/grok-bot]" in plan.read_text()
+    assert template.read_text() == "---\ntags: [session, host/<host>]\nhost:\nmodel:\n---\n"
+    assert (backup / session.relative_to(root)).is_file()
+    changes, errors = mod.scan(root)
+    assert not changes and not errors
+    broken = root / "Personal/Chats/Sessions/broken.md"
+    broken.write_text("---\nhost: codex\ntags:\n  - session\n---\n")
+    changes, errors = mod.scan(root)
+    assert not changes and len(errors) == 1
+    assert "inline tags" in errors[0][1]
+
+print("check-provenance-tags: ok")

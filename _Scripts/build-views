@@ -1,0 +1,181 @@
+#!/usr/bin/env python3
+"""Rebuild the decisions and sessions canvas.
+
+Walks the vault, skips templates and tooling, and writes one canvas.
+List notes become group labels. Each decision or session is a file card.
+A second run keeps the same ids. Safe to run on its own.
+"""
+import hashlib
+import json
+import math
+import os
+import re
+import sys
+
+VAULT = os.path.realpath(os.path.expanduser(os.environ.get("BRAIN_VAULT", "~/Documents/Brain")))
+CANVAS = "Decisions and sessions.canvas"
+SKIP = {".git", ".obsidian", "_Templates", "_Scripts", "_Config", "Skill files"}
+CARD_W = 440
+CARD_H = 520
+GAP = 40
+PAD = 40
+LABEL_H = 80
+COLS = 4
+GROUP_GAP = 120
+
+
+def node_id(key):
+    return hashlib.sha256(key.encode("utf-8")).hexdigest()[:16]
+
+
+def tags_of(text):
+    if not text.startswith("---"):
+        return []
+    end = text.find("\n---", 3)
+    if end == -1:
+        return []
+    match = re.search(r"^tags:\s*\[(.*)\]\s*$", text[:end], re.M)
+    if not match:
+        return []
+    return [part.strip() for part in match.group(1).split(",") if part.strip()]
+
+
+def heading(text, fallback):
+    for line in text.splitlines():
+        if line.startswith("# "):
+            return line[2:].strip() or fallback
+    return fallback
+
+
+def kind_of(tags):
+    if "decision" in tags:
+        return "decision"
+    if "session" in tags:
+        return "session"
+    return ""
+
+
+def is_list(name, kind):
+    if kind == "decision":
+        return name.endswith(" decisions")
+    if kind == "session":
+        return name.endswith(" sessions")
+    return False
+
+
+def group_folder(rel, kind):
+    parts = rel.split("/")
+    if kind == "session" and "Sessions" in parts:
+        return "/".join(parts[: parts.index("Sessions")])
+    return "/".join(parts[:-1])
+
+
+def read_text(path):
+    with open(path, encoding="utf-8") as handle:
+        return handle.read()
+
+
+def collect():
+    groups = {}
+    for root, dirs, files in os.walk(VAULT):
+        dirs[:] = [name for name in dirs if name not in SKIP]
+        for filename in files:
+            if not filename.endswith(".md"):
+                continue
+            path = os.path.join(root, filename)
+            rel = os.path.relpath(path, VAULT).replace(os.sep, "/")
+            try:
+                text = read_text(path)
+            except OSError:
+                continue
+            kind = kind_of(tags_of(text))
+            if not kind:
+                continue
+            name = filename[:-3]
+            folder = group_folder(rel, kind)
+            group = groups.setdefault(folder, {"kind": kind, "folder": folder, "cards": [], "label": ""})
+            if group["kind"] != kind:
+                continue
+            if is_list(name, kind):
+                group["label"] = heading(text, name)
+                continue
+            group["cards"].append(rel)
+    kept = []
+    for group in groups.values():
+        if not group["cards"]:
+            continue
+        group["cards"].sort()
+        if not group["label"]:
+            group["label"] = os.path.basename(group["folder"]) or group["folder"]
+        kept.append(group)
+    kept.sort(key=lambda group: (0 if group["kind"] == "decision" else 1, group["label"].lower()))
+    return kept
+
+
+def group_size(count):
+    cols = min(COLS, count)
+    rows = math.ceil(count / cols)
+    width = PAD * 2 + cols * CARD_W + (cols - 1) * GAP
+    height = LABEL_H + PAD + rows * CARD_H + (rows - 1) * GAP + PAD
+    return cols, width, height
+
+
+def build(groups):
+    nodes = []
+    y = 0
+    decisions = 0
+    sessions = 0
+    for group in groups:
+        cols, width, height = group_size(len(group["cards"]))
+        nodes.append({
+            "id": node_id("group:" + group["folder"]),
+            "type": "group",
+            "x": 0,
+            "y": y,
+            "width": width,
+            "height": height,
+            "label": group["label"],
+            "color": "2" if group["kind"] == "decision" else "5",
+        })
+        for index, rel in enumerate(group["cards"]):
+            col = index % cols
+            row = index // cols
+            nodes.append({
+                "id": node_id(rel),
+                "type": "file",
+                "file": rel,
+                "x": PAD + col * (CARD_W + GAP),
+                "y": y + LABEL_H + PAD + row * (CARD_H + GAP),
+                "width": CARD_W,
+                "height": CARD_H,
+            })
+            if group["kind"] == "decision":
+                decisions += 1
+            else:
+                sessions += 1
+        y += height + GROUP_GAP
+    return {"nodes": nodes, "edges": []}, decisions, sessions
+
+
+def main():
+    if not os.path.isdir(VAULT):
+        print(f"build-views: vault unreadable: {VAULT}", file=sys.stderr)
+        return 1
+    groups = collect()
+    canvas, decisions, sessions = build(groups)
+    path = os.path.join(VAULT, CANVAS)
+    text = json.dumps(canvas, indent=2, ensure_ascii=False) + "\n"
+    with open(path, "w", encoding="utf-8") as handle:
+        handle.write(text)
+    print(f"build-views: {decisions} decisions, {sessions} sessions, {len(groups)} groups")
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except BrokenPipeError:
+        sys.exit(0)
+    except Exception as error:
+        print(f"build-views: {error}", file=sys.stderr)
+        sys.exit(1)

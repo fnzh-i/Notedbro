@@ -1,0 +1,121 @@
+#!/usr/bin/env python3
+"""Check or update provenance tags on session cards and saved plans."""
+
+import argparse
+import datetime
+import os
+from pathlib import Path
+import re
+import shutil
+import tempfile
+
+from provenance import merge_provenance_tags
+
+
+VAULT = Path(os.path.realpath(os.path.expanduser(os.environ.get("BRAIN_VAULT", "~/Documents/Brain"))))
+FRONTMATTER = re.compile(r"\A---\r?\n(.*?)\r?\n---(?=\r?\n|\Z)", re.S)
+SCALAR = r"(?m)^{key}:[ \t]*([^\r\n]*)$"
+INLINE_TAGS = re.compile(r"(?m)^tags:[ \t]*\[([^\r\n]*)\][ \t]*$")
+SKIP_PARTS = {".git", ".obsidian", "_Templates", "_Scripts", "_Config", "Skill files"}
+
+
+def scalar(frontmatter, key):
+    matches = re.findall(SCALAR.format(key=re.escape(key)), frontmatter)
+    if len(matches) > 1:
+        raise ValueError(f"multiple {key} properties")
+    return matches[0].strip().strip('"\'') if matches else ""
+
+
+def split_tags(raw):
+    return [part.strip() for part in raw.split(",") if part.strip()]
+
+
+def eligible(path, vault=VAULT):
+    rel = path.relative_to(vault)
+    if any(part in SKIP_PARTS for part in rel.parts):
+        return False
+    return "Sessions" in rel.parts or (len(rel.parts) == 2 and rel.parts[0] == "Plans")
+
+
+def updated_text(path, text):
+    match = FRONTMATTER.match(text)
+    if not match:
+        raise ValueError("missing or ambiguous frontmatter delimiters")
+    frontmatter = match.group(1)
+    tag_matches = list(INLINE_TAGS.finditer(frontmatter))
+    if len(tag_matches) != 1:
+        raise ValueError("expected one inline tags property")
+    tags = split_tags(tag_matches[0].group(1))
+    kind = "session" if "session" in tags else "plan" if "plan" in tags else ""
+    if not kind:
+        return text, False
+    if kind == "session" and "Sessions" not in path.parts:
+        return text, False
+    if kind == "plan" and path.parent.name != "Plans":
+        return text, False
+    host = scalar(frontmatter, "host") or "unknown"
+    model = scalar(frontmatter, "model") or "unknown"
+    wanted = merge_provenance_tags(tags, host, model)
+    replacement = "tags: [" + ", ".join(wanted) + "]"
+    start = match.start(1) + tag_matches[0].start()
+    end = match.start(1) + tag_matches[0].end()
+    new_text = text[:start] + replacement + text[end:]
+    return new_text, new_text != text
+
+
+def scan(vault=VAULT):
+    changes = []
+    errors = []
+    for path in sorted(vault.rglob("*.md")):
+        if not eligible(path, vault):
+            continue
+        try:
+            original = path.read_text(errors="replace")
+            updated, changed = updated_text(path, original)
+            if changed:
+                changes.append((path, original, updated))
+        except (OSError, ValueError) as error:
+            errors.append((path, str(error)))
+    return changes, errors
+
+
+def apply_changes(changes, vault=VAULT, backup_root=None):
+    if not changes:
+        return None
+    if backup_root is None:
+        stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+        backup_root = Path(tempfile.mkdtemp(prefix=f"provenance-tags-{stamp}-"))
+    for path, original, updated in changes:
+        rel = path.relative_to(vault)
+        backup = backup_root / rel
+        backup.parent.mkdir(parents=True, exist_ok=True)
+        backup.write_text(original)
+        temporary = path.with_name(path.name + ".provenance.tmp")
+        temporary.write_text(updated)
+        shutil.copymode(path, temporary)
+        os.replace(temporary, path)
+    return backup_root
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--apply", action="store_true", help="write missing or stale tags")
+    args = parser.parse_args()
+    changes, errors = scan()
+    for path, message in errors:
+        print(f"ERROR {path.relative_to(VAULT)}: {message}")
+    if args.apply:
+        backup = apply_changes(changes)
+        for path, _, _ in changes:
+            print(f"UPDATED {path.relative_to(VAULT)}")
+        if backup:
+            print(f"BACKUP {backup}")
+    else:
+        for path, _, _ in changes:
+            print(f"STALE {path.relative_to(VAULT)}")
+    print(f"sync-provenance-tags: {len(changes)} change(s), {len(errors)} error(s)")
+    return 1 if errors or (changes and not args.apply) else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

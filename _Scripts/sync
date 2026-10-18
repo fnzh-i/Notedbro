@@ -1,0 +1,268 @@
+#!/usr/bin/env python3
+"""Bring merged pull requests from the publish checkout into the live vault.
+
+Runs in the publish checkout. Fetches origin/main, stops if the checkout is
+dirty, and fast-forwards. Copies only allowlisted shared files. A scheduled
+run never copies scripts. A file changed on both sides is withheld.
+"""
+
+import difflib
+import os
+import plistlib
+import shutil
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+VAULT = Path(os.path.realpath(os.path.expanduser(os.environ.get("BRAIN_VAULT", "~/Documents/Brain"))))
+CHECKOUT = Path(os.path.expanduser(os.environ.get("BRAIN_PUBLISH_DIR", "~/.local/share/brain/publish")))
+SHA_FILE = Path(os.path.expanduser(os.environ.get("BRAIN_SYNC_SHA", "~/.config/brain/sync-sha")))
+
+SHARED_FILES = {
+    "How this vault works.md", "How to use the brain.md", "Prefixes.md", "Parameters.md",
+    "Preferences.md", "Hosts.md", "Terms.md", "Graph colors.md",
+    "AGENTS.md", "CLAUDE.md",
+    "README.md", "Prerequisites.md", "How to set up.md", "SECURITY.md", "CONTRIBUTING.md",
+    "DESIGN.md", "CHANGELOG.md", "CODE_OF_CONDUCT.md", "LICENSE",
+}
+SHARED_DIRS = (".github/", "Hosts/", "_Templates/")
+SCRIPTS_DIR = "_Scripts/"
+NEVER = ("_Scripts/host-restore/", "Skill files/", ".obsidian/")
+BOOTSTRAP_SOURCES = {"How this vault works.md", "Prefixes.md", "Parameters.md"}
+
+
+def git(repo, *args, check=True):
+    result = subprocess.run(["git", "-C", str(repo), *args], capture_output=True)
+    if check and result.returncode != 0:
+        raise RuntimeError(result.stderr.decode(errors="replace").strip() or "git " + " ".join(args))
+    return result
+
+
+def allowed(rel, scripts):
+    if any(rel.startswith(prefix) for prefix in NEVER):
+        return False
+    if rel in SHARED_FILES or rel.startswith(SHARED_DIRS):
+        return True
+    return scripts and rel.startswith(SCRIPTS_DIR)
+
+
+def blob(repo, sha, rel):
+    if not sha:
+        return None
+    result = git(repo, "show", f"{sha}:{rel}", check=False)
+    return result.stdout if result.returncode == 0 else None
+
+
+def changed_paths(repo, base, head):
+    if base:
+        out = git(repo, "diff", "--name-only", "--no-renames", base, head).stdout
+    else:
+        out = git(repo, "ls-tree", "-r", "--name-only", head).stdout
+    return [line for line in out.decode().splitlines() if line]
+
+
+def live_bytes(vault, rel):
+    path = vault / rel
+    return path.read_bytes() if path.is_file() else None
+
+
+def show_diff(rel, old, new):
+    before = (old or b"").decode(errors="replace").splitlines(keepends=True)
+    after = (new or b"").decode(errors="replace").splitlines(keepends=True)
+    return "".join(difflib.unified_diff(before, after, f"live/{rel}", f"main/{rel}"))
+
+
+def regenerate_bootstrap(vault):
+    script = Path(__file__).resolve().with_name("build-bootstrap")
+    env = dict(os.environ, BRAIN_VAULT=str(vault))
+    subprocess.run([sys.executable, str(script)], env=env, capture_output=True, check=True)
+
+
+def sync(vault=VAULT, checkout=CHECKOUT, sha_file=SHA_FILE, scheduled=False, out=print):
+    if not (checkout / ".git").is_dir():
+        return f"Sync withheld: no checkout at {checkout}"
+    if git(checkout, "status", "--porcelain").stdout.strip():
+        return "Sync withheld: the checkout has uncommitted changes"
+    try:
+        git(checkout, "fetch", "--quiet", "origin", "main")
+        git(checkout, "merge", "--ff-only", "--quiet", "origin/main")
+    except RuntimeError as error:
+        return f"Sync withheld: {error}"
+    head = git(checkout, "rev-parse", "HEAD").stdout.decode().strip()
+    base = sha_file.read_text().strip() if sha_file.is_file() else ""
+    if base and git(checkout, "cat-file", "-e", base + "^{commit}", check=False).returncode != 0:
+        base = ""
+    paths = [rel for rel in changed_paths(checkout, base, head) if allowed(rel, scripts=True)]
+    if scheduled and any(
+        rel.startswith(SCRIPTS_DIR) and live_bytes(vault, rel) != blob(checkout, head, rel) for rel in paths
+    ):
+        return "Sync waiting: scripts changed"
+
+    copies = []
+    conflicts = []
+    for rel in paths:
+        new = blob(checkout, head, rel)
+        old = blob(checkout, base, rel)
+        live = live_bytes(vault, rel)
+        if live == new:
+            continue
+        if live != old:
+            conflicts.append(rel)
+            continue
+        copies.append((rel, old, new))
+    if conflicts:
+        return "Sync withheld:\n" + "\n".join(conflicts)
+
+    if not scheduled:
+        for rel, old, new in copies:
+            text = show_diff(rel, old, new)
+            if text:
+                out(text.rstrip("\n"))
+    for rel, _old, new in copies:
+        target = vault / rel
+        if new is None:
+            if target.is_file():
+                target.unlink()
+        else:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(new)
+            if rel.startswith(SCRIPTS_DIR) and blob_mode(checkout, head, rel) == "100755":
+                target.chmod(0o755)
+    touched = {rel for rel, _old, _new in copies}
+    if touched & BOOTSTRAP_SOURCES or any(rel.startswith(SCRIPTS_DIR) for rel in touched):
+        regenerate_bootstrap(vault)
+    sha_file.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
+    sha_file.write_text(head + "\n")
+    return f"Synced: {head[:7]}."
+
+
+def blob_mode(repo, sha, rel):
+    out = git(repo, "ls-tree", sha, "--", rel).stdout.decode().split()
+    return out[0] if out else ""
+
+
+def install_agent():
+    folder = Path.home() / "Library" / "LaunchAgents"
+    folder.mkdir(parents=True, exist_ok=True)
+    plist = folder / "brain-sync.plist"
+    log = Path.home() / ".local/share/brain/sync-launchd.log"
+    body = plistlib.dumps({
+        "Label": "brain-sync",
+        "ProgramArguments": [sys.executable, str(Path(__file__).resolve()), "--scheduled"],
+        "EnvironmentVariables": {"BRAIN_SCHEDULED": "1"},
+        "RunAtLoad": True,
+        "StartInterval": 4 * 60 * 60,
+        "StandardOutPath": str(log),
+        "StandardErrorPath": str(log),
+    })
+    if not plist.is_file() or plist.read_bytes() != body:
+        plist.write_bytes(body)
+    domain = f"gui/{os.getuid()}"
+    subprocess.run(["launchctl", "bootout", f"{domain}/brain-sync"], capture_output=True)
+    loaded = subprocess.run(["launchctl", "bootstrap", domain, str(plist)], capture_output=True)
+    return "LaunchAgent not loaded." if loaded.returncode else f"LaunchAgent: {plist}"
+
+
+def self_check():
+    if not shutil.which("git"):
+        raise SystemExit("self-check: git is required")
+    with tempfile.TemporaryDirectory() as raw:
+        root = Path(raw)
+        env = dict(os.environ)
+        env.update(GIT_AUTHOR_NAME="t", GIT_COMMITTER_NAME="t",
+                   GIT_AUTHOR_EMAIL="t" + "@" + "example.invalid", GIT_COMMITTER_EMAIL="t" + "@" + "example.invalid")
+        os.environ.update(env)
+        origin = root / "origin.git"
+        upstream = root / "upstream"
+        checkout = root / "checkout"
+        vault = root / "vault"
+        sha_file = root / "sync-sha"
+        subprocess.run(["git", "init", "-q", "--bare", "-b", "main", str(origin)], check=True)
+        subprocess.run(["git", "init", "-q", "-b", "main", str(upstream)], check=True)
+
+        def commit(files, message, delete=()):
+            for rel, text in files.items():
+                path = upstream / rel
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(text)
+            for rel in delete:
+                (upstream / rel).unlink()
+            git(upstream, "add", "-A")
+            git(upstream, "commit", "-q", "-m", message)
+            git(upstream, "push", "-q", str(origin), "main")
+
+        start = {
+            "Prefixes.md": "prefixes v1\n",
+            "How this vault works.md": "rules\n",
+            "Parameters.md": "params\n",
+            "Terms.md": "terms v1\n",
+            "Index.md": "starter index\n",
+            "_Templates/Old.md": "old\n",
+            "_Scripts/build-bootstrap": (Path(__file__).resolve().with_name("build-bootstrap")).read_text(),
+            "_Scripts/tool": "v1\n",
+        }
+        commit(start, "start")
+        subprocess.run(["git", "clone", "-q", str(origin), str(checkout)], check=True)
+        for rel, text in start.items():
+            target = vault / rel
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(text if rel != "Index.md" else "live index\n")
+
+        def run(scheduled):
+            return sync(vault, checkout, sha_file, scheduled=scheduled, out=lambda _text: None)
+
+        first = run(True)
+        if not first.startswith("Synced: "):
+            raise SystemExit(f"self-check: first sync was {first!r}")
+
+        commit({"Prefixes.md": "prefixes v2\n", "Index.md": "upstream index\n"}, "prefixes", delete=("_Templates/Old.md",))
+        reply = run(True)
+        if not reply.startswith("Synced: ") or (vault / "Prefixes.md").read_text() != "prefixes v2\n":
+            raise SystemExit(f"self-check: scheduled sync did not copy Prefixes: {reply}")
+        if (vault / "Index.md").read_text() != "live index\n":
+            raise SystemExit("self-check: the live Index was overwritten")
+        if (vault / "_Templates" / "Old.md").exists():
+            raise SystemExit("self-check: a template deleted upstream was kept")
+        if not (vault / "_Config" / "bootstrap.md").is_file():
+            raise SystemExit("self-check: bootstrap was not regenerated")
+        if sha_file.read_text().strip() != git(checkout, "rev-parse", "HEAD").stdout.decode().strip():
+            raise SystemExit("self-check: sync-sha was not stored")
+
+        commit({"_Scripts/tool": "v2\n"}, "script")
+        if run(True) != "Sync waiting: scripts changed" or (vault / "_Scripts" / "tool").read_text() != "v1\n":
+            raise SystemExit("self-check: a scheduled run copied a script")
+        shown = []
+        reply = sync(vault, checkout, sha_file, scheduled=False, out=shown.append)
+        if not reply.startswith("Synced: ") or (vault / "_Scripts" / "tool").read_text() != "v2\n":
+            raise SystemExit(f"self-check: a hand run did not copy the script: {reply}")
+        if not any("main/_Scripts/tool" in text for text in shown):
+            raise SystemExit("self-check: a hand run showed no diff")
+
+        commit({"Terms.md": "terms upstream\n"}, "terms")
+        (vault / "Terms.md").write_text("terms live\n")
+        reply = run(True)
+        if reply != "Sync withheld:\nTerms.md" or (vault / "Terms.md").read_text() != "terms live\n":
+            raise SystemExit(f"self-check: a two-sided change was not withheld: {reply!r}")
+
+        (checkout / "stray").write_text("x\n")
+        if run(True) != "Sync withheld: the checkout has uncommitted changes":
+            raise SystemExit("self-check: a dirty checkout was not stopped")
+    print("self-check ok")
+
+
+def main(argv):
+    if argv and argv[0] == "self-check":
+        self_check()
+        return 0
+    if argv and argv[0] == "install":
+        print(install_agent())
+        return 0
+    scheduled = "--scheduled" in argv or os.environ.get("BRAIN_SCHEDULED") == "1"
+    reply = sync(scheduled=scheduled)
+    print(reply)
+    return 0 if reply.startswith("Synced: ") else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))
