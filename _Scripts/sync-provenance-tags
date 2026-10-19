@@ -14,6 +14,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from provenance import merge_provenance_tags  # noqa: E402
 from vault_path import vault_root  # noqa: E402
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from vault_path import vault_root  # noqa: E402
+
 VAULT = vault_root()
 FRONTMATTER = re.compile(r"\A---\r?\n(.*?)\r?\n---(?=\r?\n|\Z)", re.S)
 SCALAR = r"(?m)^{key}:[ \t]*([^\r\n]*)$"
