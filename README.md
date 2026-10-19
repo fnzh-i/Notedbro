@@ -45,6 +45,7 @@ Instead, `fnsh update` writes a short session note—what was asked and what cha
 
 Brain is a starting point, not a fixed system. You can configure it however you want:
 
+- Review `Preferences.md` for response style and behavior, and `Parameters.md` for standing rules, limits, paths, and other values. The entries shipped with the starter kit are my usable defaults; keep, edit, or remove any of them to make Brain yours.
 - Edit `Prefixes.md` to add, rename, or remove `fnsh` commands.
 - Change what a session note contains, such as more detail, less detail, or different headings.
 - Add your own folders for projects, school, or work. Unknown folders are treated as private by default.

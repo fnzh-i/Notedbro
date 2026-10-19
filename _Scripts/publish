@@ -361,6 +361,9 @@ def self_check():
                 raise SystemExit(f"self-check: {rel} was not generated")
         if "Live index" in (out / "Index.md").read_text():
             raise SystemExit("self-check: live Index was copied")
+        for rel in ("Preferences.md", "Parameters.md"):
+            if (out / rel).read_bytes() != (vault / rel).read_bytes():
+                raise SystemExit(f"self-check: {rel} was not copied intact")
 
         if shutil.which("git"):
             subprocess.run(["git", "init", "-q", str(out)], check=True)
