@@ -1,0 +1,56 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    name: validate (${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version:
+          - "3.9"
+          - "3.15"
+    env:
+      BRAIN_VAULT: ${{ github.workspace }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes age zstd
+
+      - name: Run repository validators
+        run: |
+          python _Scripts/check-collaboration
+          python _Scripts/check-file-session
+          python _Scripts/check-provenance-tags
+          python _Scripts/check-vault
+
+      - name: Run script self-checks
+        run: |
+          python _Scripts/publish self-check
+          python _Scripts/sync self-check
+          python _Scripts/rebuild self-check
+          python _Scripts/shadow self-check

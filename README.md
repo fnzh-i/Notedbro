@@ -7,6 +7,10 @@
 </p>
 
 <p align="center">
+  <a href="https://github.com/fnzh-i/Cerebro/actions/workflows/ci.yml"><img src="https://github.com/fnzh-i/Cerebro/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+</p>
+
+<p align="center">
   <a href="How%20to%20set%20up.md">How to set up</a> ·
   <a href="Prerequisites.md">Prerequisites</a> ·
   <a href="CONTRIBUTING.md">Contributing</a> ·
