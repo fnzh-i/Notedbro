@@ -7,10 +7,12 @@ import os
 from pathlib import Path
 import re
 import shutil
+import sys
 import tempfile
 
-from provenance import merge_provenance_tags
-
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from provenance import merge_provenance_tags  # noqa: E402
+from vault_path import vault_root  # noqa: E402
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from vault_path import vault_root  # noqa: E402
