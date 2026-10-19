@@ -26,9 +26,11 @@ def load_guard():
     return module
 
 API = "https://api.github.com/repos/fnzh-i/Notedbro/releases/latest"
+RELEASES_API = "https://api.github.com/repos/fnzh-i/Notedbro/releases"
 UNIT_PREFIXES = ("_Scripts/",)
 UNIT_FILES = {".gitignore", "_Scripts/starter-manifest.txt", "_Scripts/notedbro-version"}
 OFFLINE = "Cannot reach GitHub. Try again later."
+NO_RELEASES = "No Notedbro releases are published."
 
 
 def version_of(vault):
@@ -67,6 +69,17 @@ def release_tree():
     try:
         with urllib.request.urlopen(API, timeout=10) as response:
             payload = json.loads(response.read().decode())
+    except urllib.error.HTTPError as error:
+        if error.code != 404:
+            return None, None, OFFLINE
+        try:
+            with urllib.request.urlopen(RELEASES_API, timeout=10) as response:
+                releases = json.loads(response.read().decode())
+        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, OSError):
+            return None, None, OFFLINE
+        if releases == []:
+            return None, None, NO_RELEASES
+        return None, None, OFFLINE
     except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, OSError):
         return None, None, OFFLINE
     version = str(payload.get("tag_name", "")).lstrip("v")
@@ -181,21 +194,42 @@ def self_check():
         (vault / ".gitignore").write_text("*\n")
         os.environ["BRAIN_UPGRADE_BACKUP"] = str(root / "backup")
         os.environ["BRAIN_UPGRADE_PREVIEW"] = str(root / "preview.json")
-        os.environ["BRAIN_RELEASE_API_OFF"] = "1"
         os.environ.pop("BRAIN_RELEASE_DIR", None)
         before = list(vault.rglob("*"))
-        # No release dir and a closed port stands in for a dead network.
-        os.environ["BRAIN_RELEASE_DIR"] = str(root / "missing-release")
-        # missing dir is an error inside release_tree only if we require the file.
-        # Use an unreachable override by pointing at a file, not a directory.
-        os.environ.pop("BRAIN_RELEASE_DIR")
-        real = release_tree
+        real_urlopen = urllib.request.urlopen
 
-        def down():
-            return None, None, OFFLINE
+        class Response:
+            def __init__(self, payload):
+                self.payload = payload
 
-        globals()["release_tree"] = down
-        reply = check(vault)
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self):
+                return self.payload
+
+        def no_releases(url, timeout=10):
+            if url == API:
+                raise urllib.error.HTTPError(url, 404, "Not Found", None, None)
+            if url == RELEASES_API:
+                return Response(b"[]")
+            raise AssertionError(f"unexpected URL: {url}")
+
+        def down(_url, timeout=10):
+            raise urllib.error.URLError("offline")
+
+        try:
+            urllib.request.urlopen = no_releases
+            reply = check(vault)
+            if reply != NO_RELEASES:
+                raise SystemExit(f"self-check: no-release reply failed: {reply}")
+            urllib.request.urlopen = down
+            reply = check(vault)
+        finally:
+            urllib.request.urlopen = real_urlopen
         after = list(vault.rglob("*"))
         if reply != OFFLINE or before != after:
             raise SystemExit(f"self-check: offline check wrote or failed: {reply}")
@@ -239,7 +273,6 @@ def self_check():
             raise SystemExit("self-check: a local manifest was overwritten")
         if (vault / "_Scripts" / "notedbro-version").read_text().strip() != "1.4.0":
             raise SystemExit("self-check: the version was not replaced")
-        globals()["release_tree"] = real
     print("self-check ok")
 
 
