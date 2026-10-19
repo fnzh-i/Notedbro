@@ -6,7 +6,7 @@ project:
 # EX-NNN — short title
 
 **Project:** [[Example Portal]]
-**Branch / commits:** 
+**Branch / commits:** `<type>/<ticket-key>-<short-description>` · see `issue_branch_name_template` in [[Parameters]]
 **Asked by:** 
 
 ## What it is

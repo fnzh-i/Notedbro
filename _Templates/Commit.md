@@ -7,6 +7,7 @@ tags: [commit, temporal]
 
 Project: [[ ]]
 Next: [[ ]]
+Defaults: [[Parameters]] (documentation report and commit-message rules).
 
 ## What it does
 -
