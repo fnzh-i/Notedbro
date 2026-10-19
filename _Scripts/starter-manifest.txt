@@ -1,0 +1,37 @@
+# Paths that belong to the starter kit. A directory line ends with /.
+# Hub notes are listed one file at a time. Other files under Personal/ are not here.
+.github/
+Hosts/
+_Scripts/
+_Templates/
+assets/
+AGENTS.md
+CHANGELOG.md
+CLAUDE.md
+CODE_OF_CONDUCT.md
+CONTRIBUTING.md
+DESIGN.md
+Graph colors.md
+How this vault works.md
+How to set up.md
+How to use the brain.md
+LICENSE
+Parameters.md
+Prerequisites.md
+Preferences.md
+Prefixes.md
+README.md
+SECURITY.md
+Terms.md
+Hosts.md
+publish-denylist.example
+.gitignore
+Index.md
+Workspace map.example.md
+_Config/bootstrap.md
+Work/Example/Example.md
+Collaboration/Collaboration.md
+Hackathons/Hackathons.md
+Research/Research.md
+Personal/Personal.md
+Personal/Chats/Chats.md

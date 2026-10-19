@@ -1,29 +1,57 @@
-# Notes stay on your machine. Only the starter hubs are tracked.
-/Personal/**
-/Work/**
-/Collaboration/**
-/Hackathons/**
-/Research/**
-/Plans/**
+# Notes stay on your machine. Only starter-kit paths are tracked.
+*
+!*/
+!/.github/
+!/.github/**
+!/Hosts/
+!/Hosts/**
+!/_Scripts/
+!/_Scripts/**
+!/_Templates/
+!/_Templates/**
+!/assets/
+!/assets/**
+!/AGENTS.md
+!/CHANGELOG.md
+!/CLAUDE.md
+!/CODE_OF_CONDUCT.md
+!/CONTRIBUTING.md
+!/DESIGN.md
+!/Graph colors.md
+!/How this vault works.md
+!/How to set up.md
+!/How to use the brain.md
+!/LICENSE
+!/Parameters.md
+!/Prerequisites.md
+!/Preferences.md
+!/Prefixes.md
+!/README.md
+!/SECURITY.md
+!/Terms.md
+!/Hosts.md
+!/publish-denylist.example
+!/.gitignore
+!/Index.md
+!/Workspace map.example.md
+!/_Config/
+!/_Config/bootstrap.md
 !/Work/
 !/Work/Example/
 !/Work/Example/Example.md
-!/Personal/
-!/Personal/Personal.md
 !/Collaboration/
 !/Collaboration/Collaboration.md
 !/Hackathons/
 !/Hackathons/Hackathons.md
 !/Research/
 !/Research/Research.md
+!/Personal/
+!/Personal/Personal.md
+!/Personal/
 !/Personal/Chats/
 !/Personal/Chats/Chats.md
-
-/Workspace map.md
-!/Workspace map.example.md
 /_Scripts/host-restore/
-Skill files/
-.obsidian/
+/Workspace map.md
 *.canvas
 *.jsonl
 .DS_Store
@@ -32,3 +60,5 @@ Skill files/
 *.age
 shadow.key
 __pycache__/
+# >>> brain-guard
+# <<< brain-guard

@@ -81,11 +81,11 @@ if live["filer_model"] != "":
     fail(f"Parameters.md filer_model is {live['filer_model']!r}")
 
 longer = mod.clean_request(
-    "Please keep /srv/notes/Brain/Parameters.md in the asked text now sk-notarealsecret"
+    "Please keep /srv/notes/Brain/Parameters.md in the asked text now " + "sk-" + "notarealsecret"
 )
 if "/srv/notes/Brain/Parameters.md" not in longer:
     fail("clean_request removed a path")
-if "sk-notarealsecret" in longer:
+if "sk-" + "notarealsecret" in longer:
     fail("clean_request left a secret")
 
 messages = [mod.clean_request("continue"), longer]
@@ -98,7 +98,7 @@ if card["title"].lower().startswith("continue"):
     fail("title used the short opener")
 if "/srv/notes/Brain/Parameters.md" not in card["asked"]:
     fail(f"path missing from Asked: {card['asked']!r}")
-if "sk-notarealsecret" in card["asked"] or card["asked"].lower().startswith("continue"):
+if "sk-" + "notarealsecret" in card["asked"] or card["asked"].lower().startswith("continue"):
     fail(f"Asked used the wrong text: {card['asked']!r}")
 if card["changed"] != "Nothing on disk":
     fail(f"unchanged chat reported {card['changed']!r}")

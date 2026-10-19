@@ -43,6 +43,17 @@ Extra `fnsh <set> params` sets, read before the table in Prefixes.md.
 ## Routing
 - Shared projects go under `Collaboration/<Project>/` with the tags `collaboration, <project-slug>`.
 
+## Maintainer
+Leave this out unless you keep a private vault and a public copy.
+
+- maintainer: no
+
+## Ship
+| Project | Rule | Folder |
+|---|---|---|
+| Example kit | cerebro | ~/.local/share/brain/publish |
+| Example website | branch-pr | ~/Code/example-website |
+
 ## Project tags
 | Project | Tag |
 |---|---|

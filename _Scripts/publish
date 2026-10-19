@@ -18,14 +18,29 @@ import tempfile
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from workspace_map import load_map  # noqa: E402
+import publish_scan  # noqa: E402
+from publish_scan import map_terms, read_terms, scan_text_hits  # noqa: E402
+from vault_path import vault_root  # noqa: E402
 
-VAULT = Path(os.path.realpath(os.path.expanduser(os.environ.get("BRAIN_VAULT", "~/Documents/Brain"))))
+VAULT = vault_root()
 OUT = Path(os.path.expanduser(os.environ.get("BRAIN_PUBLISH_DIR", "~/.local/share/brain/publish")))
 DENYLIST = Path(os.path.expanduser(os.environ.get("BRAIN_PUBLISH_DENYLIST", "~/.config/brain/publish-denylist")))
-REPO_URL = "https://github.com/fnzh-i/Cerebro"
+REPO_URL = publish_scan.PUBLIC_REPO
+API_REPO = publish_scan.PUBLIC_API
 PRODUCT = REPO_URL.rsplit("/", 1)[1]
 
+GENERATED = {
+    ".gitignore",
+    "Index.md",
+    "Workspace map.example.md",
+    "_Config/bootstrap.md",
+    "Work/Example/Example.md",
+    "Collaboration/Collaboration.md",
+    "Hackathons/Hackathons.md",
+    "Research/Research.md",
+    "Personal/Personal.md",
+    "Personal/Chats/Chats.md",
+}
 INCLUDE_FILES = (
     "How this vault works.md",
     "How to use the brain.md",
@@ -61,7 +76,7 @@ AREAS = ("Personal", "Work", "Collaboration", "Hackathons", "Research", "Plans")
 EMAIL = re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b")
 PHONE = re.compile(r"(?<![\w.-])(?:\+?\d{1,3}[ .-])?\(?\d{3}\)?[ .-]\d{3}[ .-]\d{4}(?![\w.-])")
 IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".ico", ".bmp"}
-ALLOWED_URL = re.compile(re.escape(REPO_URL) + r"[A-Za-z0-9/._#?=&-]*")
+ALLOWED_URL = publish_scan.ALLOWED_URL
 
 
 def assert_outside(path, vault, label):
@@ -90,18 +105,23 @@ def iter_files(root):
 
 
 def included(vault):
-    """Relative paths to copy, plus the include-list entries that are missing."""
+    """Manifest paths to copy, plus entries that are missing. Generated paths are skipped."""
+    files, dirs = publish_scan.read_manifest(vault)
+    if not files and not dirs:
+        return [], ["_Scripts/starter-manifest.txt"]
     found = []
     missing = []
-    for name in INCLUDE_FILES:
+    for name in files:
+        if name in GENERATED:
+            continue
         if (vault / name).is_file():
             found.append(Path(name))
         else:
             missing.append(name)
-    for folder in INCLUDE_DIRS:
+    for folder in dirs:
         root = vault / folder
         if not root.is_dir():
-            missing.append(folder + "/")
+            missing.append(folder)
             continue
         for path in iter_files(root):
             rel = path.relative_to(vault)
@@ -142,23 +162,27 @@ def chats_text():
     )
 
 
-def gitignore_text():
-    lines = ["# Notes stay on your machine. Only the starter hubs are tracked."]
-    for area in AREAS:
-        lines.append(f"/{area}/**")
-    for folder, title in HUBS:
-        parts = folder.split("/")
+def gitignore_text(vault=None):
+    """Star-ignore, then descend, then un-ignore only manifest paths."""
+    files, dirs = publish_scan.read_manifest(vault or VAULT)
+    lines = [
+        "# Notes stay on your machine. Only starter-kit paths are tracked.",
+        "*",
+        "!*/",
+    ]
+    for folder in dirs:
+        lines.append("!/" + folder)
+        lines.append("!/" + folder + "**")
+    for name in files:
+        if any(name.startswith(folder) for folder in dirs):
+            continue
+        parts = name.split("/")
         for depth in range(1, len(parts)):
             lines.append("!/" + "/".join(parts[:depth]) + "/")
-        lines.append(f"!/{folder}/")
-        lines.append(f"!/{folder}/{title}.md")
-    lines += ["!/Personal/Chats/", "!/Personal/Chats/Chats.md", ""]
+        lines.append("!/" + name)
     lines += [
-        "/Workspace map.md",
-        "!/Workspace map.example.md",
         "/_Scripts/host-restore/",
-        "Skill files/",
-        ".obsidian/",
+        "/Workspace map.md",
         "*.canvas",
         "*.jsonl",
         ".DS_Store",
@@ -167,6 +191,8 @@ def gitignore_text():
         "*.age",
         "shadow.key",
         "__pycache__/",
+        "# >>> brain-guard",
+        "# <<< brain-guard",
     ]
     return "\n".join(lines) + "\n"
 
@@ -194,83 +220,21 @@ def build_tree(vault, dest):
         write(dest / "Workspace map.example.md", example.read_text())
     else:
         missing.append("_Templates/Workspace map.md")
-    write(dest / ".gitignore", gitignore_text())
+    write(dest / ".gitignore", gitignore_text(vault))
     bootstrap = load_script("build-bootstrap")
     write(dest / "_Config" / "bootstrap.md", bootstrap.render(dest))
     return missing
 
 
-def read_terms(path):
-    if not path.is_file():
-        return []
-    terms = []
-    for line in path.read_text().splitlines():
-        line = line.strip()
-        if line and not line.startswith("#"):
-            terms.append(line)
-    return terms
-
-
-def map_terms(vault):
-    found = load_map(vault)
-    if not found["path"] or Path(found["path"]).name != "Workspace map.md":
-        return []
-    terms = []
-    if found["company"]:
-        terms.append(found["company"])
-    if found["ticket_key"]:
-        terms.append(found["ticket_key"] + "-")
-    terms += [name for _path, name, _area in found["workspaces"]]
-    terms += found["projects"]
-    terms += [name for name in found["param_sets"] if name not in ("main", "example")]
-    return terms
-
-
-def term_pattern(term):
-    body = r"\s+".join(re.escape(part) for part in term.split())
-    if term.endswith("-"):
-        return re.compile(r"(?<![A-Za-z0-9_])" + body)
-    return re.compile(r"(?<![A-Za-z0-9_])" + body + r"(?![A-Za-z0-9_])", re.I)
-
-
 def scan(root, terms):
-    """Return 'path: kind' lines for anything private in the tree."""
-    patterns = []
-    seen = set()
-    for term in terms:
-        if term and term.lower() not in seen:
-            seen.add(term.lower())
-            patterns.append((term, term_pattern(term)))
-    home = str(Path.home())
-    login = term_pattern(getpass.getuser())
-    product = term_pattern(PRODUCT)
-    hits = []
-    for path in iter_files(root):
-        rel = path.relative_to(root).as_posix()
-        if path.suffix.lower() in IMAGE_SUFFIXES:
-            continue
-        try:
-            text = path.read_bytes().decode("utf-8", errors="replace")
-        except OSError:
-            hits.append(f"{rel}: unreadable")
-            continue
-        text = ALLOWED_URL.sub("", text)
-        kinds = []
-        if EMAIL.search(text):
-            kinds.append("email")
-        if PHONE.search(text):
-            kinds.append("phone")
-        if home and home in text:
-            kinds.append("home folder")
-        if login.search(text):
-            kinds.append("login name")
-        if rel not in ("DESIGN.md", "README.md") and not rel.startswith("assets/") and product.search(text):
-            kinds.append(f"{PRODUCT} outside the title")
-        for term, pattern in patterns:
-            if pattern.search(text):
-                kinds.append(f"denylist ({term})")
-        hits.extend(f"{rel}: {kind}" for kind in kinds)
-    return hits
+    return publish_scan.scan(
+        root, terms, product=PRODUCT,
+        allow_product_paths={
+            "DESIGN.md", "README.md", "Prefixes.md", "How to use the brain.md",
+            "_Config/bootstrap.md",
+        },
+        allowed_url=ALLOWED_URL,
+    )
 
 
 def check_tree(root):
@@ -308,6 +272,20 @@ def swap(staging, out):
 
 
 def publish(vault=VAULT, out=OUT, denylist=DENYLIST):
+    if not publish_scan.maintainer_ready(vault, denylist):
+        return publish_scan.MAINTAINER_MESSAGE, False
+    denied = publish_scan.denylist_problems(denylist)
+    if denied:
+        return "\n".join(denied + [publish_scan.LOCAL_LINE]), False
+    try:
+        path = Path(__file__).resolve().with_name("guard")
+        loader = importlib.machinery.SourceFileLoader("guard_script", str(path))
+        spec = importlib.util.spec_from_loader(loader.name, loader)
+        module = importlib.util.module_from_spec(spec)
+        loader.exec_module(module)
+        module.run(vault, verbose=False)
+    except Exception:
+        pass
     assert_outside(out, vault, "publish folder")
     if out.is_symlink():
         raise SystemExit("Refused to replace a symlinked publish folder")
@@ -317,9 +295,12 @@ def publish(vault=VAULT, out=OUT, denylist=DENYLIST):
     try:
         missing = build_tree(vault, staging)
         problems = [f"{name}: missing from the vault" for name in missing]
-        problems += scan(staging, read_terms(denylist) + map_terms(vault))
+        scanned = scan(staging, read_terms(denylist) + map_terms(vault))
+        problems += scanned
         problems += check_tree(staging)
         if problems:
+            if scanned:
+                problems.append(publish_scan.LOCAL_LINE)
             return "\n".join(problems + ["Publish withheld."]), False
         swap(staging, out)
         return f"Published: {shown(out)}", True
@@ -341,7 +322,7 @@ def self_check():
         denylist = root / "denylist"
         planted_project = "Quill" + "stone Labs"
         planted_email = "ada" + "@" + "example.org"
-        denylist.write_text("# test terms\n" + planted_project + "\n" + "ZQ" + "-\n")
+        denylist.write_text("# test terms\n" + planted_project + "\n" + "ZQ" + "-\n" + "Sample" + "town\n")
 
         source = Path(__file__).resolve().parent.parent
         files, _missing = included(source)
@@ -353,15 +334,29 @@ def self_check():
         write(vault / "Personal" / f"{diary}.md", "---\ntags: [personal]\n---\n# Private\n")
         write(vault / "Index.md", "---\ntags: [meta]\n---\n# Live index\n")
 
+        bare = root / "bare-out"
+        reply, ok = publish(vault, bare, denylist)
+        if ok or publish_scan.MAINTAINER_MESSAGE not in reply or bare.exists():
+            raise SystemExit(f"self-check: missing maintainer setup did not refuse cleanly:\n{reply}")
+        write(vault / "Workspace map.md", (
+            "## Maintainer\n- maintainer: yes\n\n## Ship\n"
+            "| Project | Rule | Folder |\n|---|---|---|\n"
+            f"| Example kit | cerebro | {out} |\n"
+        ))
+
         reply, ok = publish(vault, out, denylist)
         if not ok or reply != f"Published: {shown(out)}":
             raise SystemExit(f"self-check: clean publish failed:\n{reply}")
         names = {path.relative_to(out).as_posix() for path in iter_files(out)}
-        for rel in (f"Personal/{diary}.md", "_Scripts/host-restore/claude/CLAUDE.md"):
-            if rel in names:
+        for rel in names:
+            if rel.startswith("_Scripts/host-restore/"):
                 raise SystemExit(f"self-check: {rel} was published")
-        for rel in ("Work/Example/Example.md", "Personal/Personal.md", "Personal/Chats/Chats.md", "Collaboration/Collaboration.md",
-                    "Hackathons/Hackathons.md", "Research/Research.md", "Workspace map.example.md", ".gitignore", "_Config/bootstrap.md"):
+            if rel.startswith("Personal/") and rel not in ("Personal/Personal.md", "Personal/Chats/Chats.md"):
+                raise SystemExit(f"self-check: {rel} was published")
+        for rel in ("Work/Example/Example.md", "Collaboration/Collaboration.md",
+                    "Hackathons/Hackathons.md", "Research/Research.md",
+                    "Personal/Personal.md", "Personal/Chats/Chats.md",
+                    "Workspace map.example.md", ".gitignore", "_Config/bootstrap.md"):
             if rel not in names:
                 raise SystemExit(f"self-check: {rel} was not generated")
         if "Live index" in (out / "Index.md").read_text():
@@ -369,23 +364,25 @@ def self_check():
 
         if shutil.which("git"):
             subprocess.run(["git", "init", "-q", str(out)], check=True)
-            for rel in ("Personal/Diary.md", "Work/Acme/Acme.md", "Research/Topic/Topic.md", "Workspace map.md",
+            for rel in ("Personal/Diary.md", "Work/Acme/Acme.md", "Work/Example/my-note.md", "School/note.md",
+                        "Research/Topic/Topic.md", "Workspace map.md",
                         "Plans/plan.md", "Skill files/x.md", "_Scripts/host-restore/x", "a.canvas", "shadow.key"):
                 if not ignored(out, rel):
                     raise SystemExit(f"self-check: {rel} is not ignored")
-            for rel in ("Work/Example/Example.md", "Personal/Personal.md", "Personal/Chats/Chats.md",
-                        "Research/Research.md", "Workspace map.example.md", "README.md"):
+            for rel in ("Work/Example/Example.md", "Research/Research.md", "Personal/Personal.md",
+                        "Personal/Chats/Chats.md", "Workspace map.example.md", "README.md",
+                        "_Scripts/publish"):
                 if ignored(out, rel):
                     raise SystemExit(f"self-check: {rel} is ignored")
 
         before = (out / "Index.md").read_text()
         (out / "marker").write_text("previous\n")
         for rel, text, kind in (
-            ("Prefixes.md", planted_email, "Prefixes.md: email"),
-            ("Terms.md", planted_project.lower(), f"Terms.md: denylist ({planted_project})"),
-            ("Parameters.md", "see " + "ZQ" + "-12", "Parameters.md: denylist (" + "ZQ" + "-)"),
-            ("Hosts.md", "the " + PRODUCT + " kit", f"Hosts.md: {PRODUCT} outside the title"),
-            ("Hosts.md", str(Path.home()) + "/x", "Hosts.md: home folder"),
+            ("Prefixes.md", planted_email, "email ("),
+            ("Terms.md", planted_project.lower(), f"denylist ({planted_project})"),
+            ("Parameters.md", "see " + "ZQ" + "-12", "denylist (" + "ZQ" + "-)"),
+            ("Hosts.md", "the " + PRODUCT + " kit", f"{PRODUCT} outside the title"),
+            ("Hosts.md", str(Path.home()) + "/x", "home folder"),
         ):
             original = (vault / rel).read_text()
             (vault / rel).write_text(original + text + "\n")
@@ -417,7 +414,17 @@ def self_check():
         if not ok or not (out / ".git").is_dir():
             raise SystemExit(f"self-check: republish lost .git:\n{reply}")
         if "My real hub" in (out / "Personal" / "Personal.md").read_text():
-            raise SystemExit("self-check: a live hub was published")
+            raise SystemExit("self-check: live Personal.md was copied")
+        if not (out / "Personal" / "Chats" / "Chats.md").is_file():
+            raise SystemExit("self-check: starter Chats.md was missing")
+        sample = root / "sample-deny"
+        sample.write_text("SAMPLE-EMPLOYER\nSAMPLE-CLIENT\nSAMPLE-NAME\n")
+        reply, ok = publish(vault, root / "sample-out", sample)
+        if ok or "sample words" not in reply or (root / "sample-out").exists():
+            raise SystemExit(f"self-check: a sample denylist was not refused:\n{reply}")
+        token = "gh" + "p_" + "abcdefghij"
+        if not any("****" in hit for hit in publish_scan.scan_text("token " + token, [])):
+            raise SystemExit("self-check: a token was not masked")
 
         try:
             publish(vault, vault / "publish", denylist)
@@ -427,10 +434,6 @@ def self_check():
         else:
             raise SystemExit("self-check: write inside the vault was allowed")
     print("self-check ok")
-
-
-def scan_text_hits(text, terms):
-    return [term for term in terms if term_pattern(term).search(text)]
 
 
 def main():

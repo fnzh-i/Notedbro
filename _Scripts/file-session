@@ -15,9 +15,10 @@ import urllib.error
 import urllib.request
 
 from provenance import provenance_tags
+from vault_path import vault_root
 from workspace_map import load_map
 
-VAULT = os.path.realpath(os.path.expanduser(os.environ.get("BRAIN_VAULT", "~/Documents/Brain")))
+VAULT = str(vault_root())
 CHANGE_TOOLS = {"Write", "StrReplace", "Edit", "EditNotebook", "NotebookEdit"}
 PATH_KEYS = ("path", "file_path", "notebook_path", "target_notebook")
 HOME = os.path.expanduser("~")
@@ -34,7 +35,7 @@ PROFILES = {
     "unknown": "Hosts/Unknown",
 }
 WEB_HOSTS = {"chatgpt", "claude-ai", "gemini", "unknown"}
-ACTION_WORDS = {"brain", "update", "params", "prefs", "remember", "load", "ticket", "config", "wins", "plan", "check", "shadow", "publish", "sync", "rebuild"}
+ACTION_WORDS = {"brain", "update", "params", "prefs", "remember", "load", "ticket", "config", "wins", "plan", "check", "shadow", "publish", "sync", "rebuild", "ship", "guard", "upgrade"}
 PLAN_NAME = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 ACTION_LETTER = {
     "load": "l",

@@ -6,10 +6,15 @@ import importlib.machinery
 import importlib.util
 import os
 import re
+import subprocess
+import sys
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from vault_path import vault_root  # noqa: E402
+import publish_scan  # noqa: E402
 
-VAULT = Path(os.path.realpath(os.path.expanduser(os.environ.get("BRAIN_VAULT", "~/Documents/Brain"))))
+VAULT = vault_root()
 REQUIRED = (
     "Index.md",
     "How this vault works.md",
@@ -222,12 +227,49 @@ def check(vault=VAULT):
     return problems
 
 
+def cerebro_version():
+    path = Path(__file__).with_name("cerebro-version")
+    return path.read_text(errors="replace").strip() if path.is_file() else "0"
+
+
+def manifest_warnings(vault):
+    """Warn when a tracked file was shared but left off the starter manifest."""
+    files, dirs = publish_scan.read_manifest(vault)
+    result = subprocess.run(
+        ["git", "-C", str(vault), "ls-files"],
+        capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        return []
+    warnings = []
+    for rel in result.stdout.splitlines():
+        if publish_scan.in_manifest(rel, files, dirs) or publish_scan.is_private_path(rel):
+            continue
+        warnings.append(f"Not in manifest: {rel}")
+    return warnings
+
+
 def main():
+    try:
+        path = Path(__file__).with_name("guard")
+        loader = importlib.machinery.SourceFileLoader("guard_script", str(path))
+        spec = importlib.util.spec_from_loader(loader.name, loader)
+        module = importlib.util.module_from_spec(spec)
+        loader.exec_module(module)
+        result = module.run(VAULT, verbose=False)
+        if result["text"]:
+            print(result["text"])
+    except Exception:
+        pass
     problems = check()
+    denylist = Path(os.path.expanduser(os.environ.get("BRAIN_PUBLISH_DENYLIST", "~/.config/brain/publish-denylist")))
+    if not publish_scan.maintainer_ready(VAULT, denylist):
+        problems = [item for item in problems if "fnsh publish" not in item and "fnsh sync" not in item]
+    problems += manifest_warnings(VAULT)
     if problems:
         print("\n".join(problems))
         raise SystemExit(1)
-    print("Vault ok.")
+    print(f"Vault ok. Cerebro v{cerebro_version()}.")
 
 
 if __name__ == "__main__":

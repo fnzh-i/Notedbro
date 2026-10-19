@@ -3,10 +3,14 @@
 
 import hashlib
 import os
+import sys
 from pathlib import Path
 
 
-VAULT = Path(os.path.realpath(os.path.expanduser(os.environ.get("BRAIN_VAULT", "~/Documents/Brain"))))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from vault_path import vault_root  # noqa: E402
+
+VAULT = vault_root()
 SOURCES = (
     "How this vault works.md",
     "Prefixes.md",

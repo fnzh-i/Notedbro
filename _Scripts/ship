@@ -1,0 +1,471 @@
+#!/usr/bin/env python3
+"""Ship a project by its Workspace map rule. Never pushes main. Never resets hard."""
+
+import hashlib
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import publish_scan  # noqa: E402
+import workspace_map  # noqa: E402
+from vault_path import vault_root  # noqa: E402
+
+PREVIEW_SECONDS = 30 * 60
+TYPES = ("feat", "fix", "chore", "refactor", "docs", "test")
+LOCAL_LINE = "Checked locally. Nothing was sent anywhere."
+
+
+def preview_path():
+    return Path(os.path.expanduser(os.environ.get("BRAIN_SHIP_PREVIEW", "~/.local/share/brain/ship-preview.json")))
+
+
+def pr_path():
+    return Path(os.path.expanduser(os.environ.get("BRAIN_PR_FILE", "~/.local/share/brain/pr.md")))
+
+
+def denylist_path():
+    return Path(os.path.expanduser(os.environ.get("BRAIN_PUBLISH_DENYLIST", "~/.config/brain/publish-denylist")))
+
+
+def git(repo, *args, check=True):
+    result = subprocess.run(["git", "-C", str(repo), *args], capture_output=True, text=True)
+    if check and result.returncode != 0:
+        raise RuntimeError(result.stderr.strip() or "git " + " ".join(args))
+    return result
+
+
+def branch_name(title):
+    words = re.sub(r"[^a-z0-9]+", "-", title.lower()).strip("-").split("-")
+    words = [word for word in words if word][:4] or ["update"]
+    name = "docs/" + "-".join(words)
+    if name in {"main", "master"} or name.startswith("main/"):
+        name = "docs/update"
+    return name
+
+
+def diff_names(repo, base):
+    diff = git(repo, "diff", "--name-only", base, check=False).stdout.splitlines()
+    others = git(repo, "ls-files", "--others", "--exclude-standard", check=False).stdout.splitlines()
+    return sorted({line.strip() for line in diff + others if line.strip()})
+
+
+def file_hash(repo, names):
+    digest = hashlib.sha256()
+    for name in names:
+        digest.update(name.encode())
+        path = Path(repo) / name
+        if path.is_file():
+            digest.update(path.read_bytes())
+    return digest.hexdigest()
+
+
+def project_rule(vault, project):
+    found = workspace_map.load_map(vault)
+    ships = found.get("ships", [])
+    if project:
+        key = project.lower()
+        for name, rule, folder in ships:
+            if name.lower() == key or workspace_map.expand(name).lower() == key:
+                return name, rule, folder, found
+        return None
+    return None
+
+
+def grouped(unknown, private, scans):
+    lines = []
+    folders = {}
+    loose = []
+    for rel in unknown:
+        top, _, rest = rel.partition("/")
+        if rest:
+            folders.setdefault(top + "/", []).append(rel)
+        else:
+            loose.append(rel)
+    if unknown or private:
+        count_folders = len(folders)
+        count_files = len(loose) + len(private)
+        lines.append(f"Ship blocked: {count_folders} folders and {count_files} files are not part of the starter kit.")
+        lines.append("Unknown folders and files are treated as private.")
+        lines.append("")
+        for folder, paths in sorted(folders.items()):
+            lines.append(f"  {folder:<14} ({len(paths)} files)")
+        shown = private + loose
+        extra = shown[10:]
+        for rel in shown[:10]:
+            lines.append(f"  {rel}")
+        if extra:
+            lines.append(f"  and {len(extra)} more")
+        lines.append("")
+        lines.append("To ship a project folder on purpose, add a row for it to ## Ship in Workspace map.md.")
+        lines.append("Run fnsh guard to keep these out of git.")
+    if scans:
+        lines.append("Content scan:")
+        for rel, hits in scans:
+            shown = hits[:10]
+            lines.append(f"  {rel}: " + ", ".join(shown))
+            if len(hits) > 10:
+                lines.append(f"    and {len(hits) - 10} more")
+    lines.append(LOCAL_LINE)
+    return "\n".join(lines)
+
+
+def classify(vault, repo, names, project_folder):
+    files, dirs = publish_scan.read_manifest(repo)
+    if not files and not dirs:
+        files, dirs = publish_scan.read_manifest(vault)
+    unknown, private = [], []
+    root = Path(project_folder).resolve() if project_folder else None
+    repo_root = Path(repo).resolve()
+    for rel in names:
+        if publish_scan.is_private_path(rel) and not publish_scan.in_manifest(rel, files, dirs):
+            private.append(rel)
+            continue
+        if publish_scan.in_manifest(rel, files, dirs):
+            continue
+        inside = False
+        if root and root != repo_root:
+            try:
+                (repo_root / rel).resolve().relative_to(root)
+                inside = True
+            except ValueError:
+                inside = False
+        if inside:
+            continue
+        unknown.append(rel)
+    scans = []
+    terms = publish_scan.read_terms(denylist_path()) if denylist_path().is_file() else []
+    for rel in names:
+        path = Path(repo) / rel
+        if not path.is_file() or path.suffix.lower() in publish_scan.IMAGE_SUFFIXES:
+            continue
+        hits = publish_scan.scan_text(path.read_text(errors="replace"), terms)
+        if hits:
+            scans.append((rel, hits))
+    return unknown, private, scans
+
+
+def pr_text(repo, title, names):
+    template = Path(repo) / ".github" / "PULL_REQUEST_TEMPLATE.md"
+    body = template.read_text(errors="replace") if template.is_file() else "## What changed\n\n## Checklist\n"
+    changed = "\n".join(f"- `{name}`" for name in names) or "- none"
+    text = f"# {title}\n\n{body}\n\n## Files\n{changed}\n"
+    return text
+
+
+def title_from(repo):
+    changelog = Path(repo) / "CHANGELOG.md"
+    if changelog.is_file():
+        for line in changelog.read_text(errors="replace").splitlines():
+            if line.startswith("- "):
+                return line[2:].split("—", 1)[-1].strip()[:80]
+    return "Update the starter kit"
+
+
+def public_repo(repo):
+    flag = os.environ.get("BRAIN_SHIP_PUBLIC")
+    if flag == "1":
+        return True
+    if flag == "0":
+        return False
+    if not shutil_which("gh"):
+        return True
+    result = subprocess.run(["gh", "repo", "view", "--json", "visibility"], cwd=str(repo), capture_output=True, text=True)
+    if result.returncode != 0:
+        return True
+    return "public" in result.stdout.lower()
+
+
+def shutil_which(name):
+    from shutil import which
+    return which(name)
+
+
+def restore(repo, rule, start):
+    if rule == "cerebro":
+        git(repo, "checkout", "main")
+        git(repo, "pull", "--ff-only", check=False)
+        return
+    git(repo, "checkout", start)
+
+
+def write_preview(payload):
+    path = preview_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload))
+    pr = pr_path()
+    pr.parent.mkdir(parents=True, exist_ok=True)
+    pr.write_text(payload["body"])
+
+
+def preview(vault, repo, project, rule, folder):
+    if os.environ.get("SHIP_SCHEDULED") == "1":
+        return "Ship withheld: scheduled runs cannot ship."
+    if rule == "cerebro" and not publish_scan.maintainer_ready(vault, denylist_path()):
+        return publish_scan.MAINTAINER_MESSAGE
+    start = git(repo, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip()
+    git(repo, "fetch", check=False)
+    base = "origin/main"
+    if rule == "branch-pr" and git(repo, "rev-parse", "--verify", "origin/main", check=False).returncode != 0:
+        base = start
+    names = diff_names(repo, base)
+    if not names:
+        return "Ship withheld: nothing to ship."
+    unknown, private, scans = classify(vault, repo, names, folder if rule == "branch-pr" else "")
+    blocked = f"blocked: {len(unknown)} unknown paths, {len(private)} private-folder files, {len(scans)} scan hits"
+    if unknown or private or scans:
+        return grouped(unknown, private, scans) + "\n" + blocked
+    title = title_from(repo)
+    branch = branch_name(title)
+    body = pr_text(repo, title, names)
+    scan_hits = publish_scan.scan_text(title + "\n" + body, publish_scan.read_terms(denylist_path()))
+    if scan_hits:
+        return "Ship withheld: the pull request text failed the scan.\n" + "\n".join(scan_hits) + "\n" + publish_scan.LOCAL_LINE
+    is_public = public_repo(repo)
+    payload = {
+        "project": project,
+        "rule": rule,
+        "folder": str(folder),
+        "repo": str(Path(repo).resolve()),
+        "branch": branch,
+        "start": start,
+        "base": base,
+        "hash": file_hash(repo, names),
+        "names": names,
+        "title": title,
+        "body": body,
+        "public": is_public,
+        "time": time.time(),
+    }
+    write_preview(payload)
+    notice = "This PR is public.\n" if is_public else ""
+    ask = "Ship? fnsh ship yes public" if is_public else "Ship? fnsh ship yes"
+    remote = git(repo, "remote", "get-url", "origin", check=False).stdout.strip()
+    return "\n".join([
+        f"Project: {project}",
+        f"Folder: {folder}",
+        f"Remote: {remote}",
+        f"Branch: {branch}",
+        "Files:",
+        *[f"- {name}" for name in names],
+        blocked,
+        notice + body,
+        ask,
+    ])
+
+
+def apply_preview(confirm_public):
+    if os.environ.get("SHIP_SCHEDULED") == "1":
+        return "Ship withheld: scheduled runs cannot ship."
+    path = preview_path()
+    if not path.is_file():
+        return "Ship withheld: no preview."
+    payload = json.loads(path.read_text())
+    if time.time() - payload["time"] > PREVIEW_SECONDS:
+        return "Ship withheld: the preview expired."
+    repo = payload["repo"]
+    names = diff_names(repo, payload["base"])
+    if file_hash(repo, names) != payload["hash"]:
+        return "Ship withheld: the files changed. Ship again."
+    if payload["branch"] in {"main", "master"}:
+        return "Ship withheld: refusing to push main."
+    if payload.get("public") and not confirm_public:
+        return "This PR is public.\nShip? fnsh ship yes public"
+    unknown, private, scans = classify(payload.get("vault", repo), repo, names, payload["folder"] if payload["rule"] == "branch-pr" else "")
+    if unknown or private or scans:
+        return grouped(unknown, private, scans)
+    saved = {}
+    for name in names:
+        path = Path(repo) / name
+        if path.is_file():
+            saved[name] = path.read_bytes()
+    if payload["rule"] == "cerebro":
+        git(repo, "checkout", "-f", "-B", payload["branch"], "origin/main")
+    else:
+        git(repo, "checkout", "-B", payload["branch"], "HEAD")
+    for name, data in saved.items():
+        path = Path(repo) / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(data)
+    git(repo, "add", "--", *names)
+    git(repo, "commit", "-m", payload["title"] + "\n\n" + payload["body"])
+    git(repo, "push", "-u", "origin", "HEAD:refs/heads/" + payload["branch"])
+    pushed = payload["branch"]
+    restore(repo, payload["rule"], payload["start"])
+    if git(repo, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip() == pushed:
+        return "Ship withheld: the checkout stayed on the feature branch."
+    url = git(repo, "remote", "get-url", "origin", check=False).stdout.strip()
+    compare = url.rstrip("/") + "/compare/" + pushed + "?expand=1"
+    proc = subprocess.run(
+        ["gh", "pr", "create", "--title", payload["title"], "--body-file", str(pr_path())],
+        cwd=repo, capture_output=True, text=True,
+    ) if shutil_which("gh") and os.environ.get("BRAIN_SHIP_GH") != "0" else None
+    if proc and proc.returncode == 0 and proc.stdout.strip():
+        return proc.stdout.strip()
+    return compare
+
+
+def resolve(argv, vault):
+    if os.environ.get("SHIP_SCHEDULED") == "1":
+        return "Ship withheld: scheduled runs cannot ship."
+    if argv[:1] == ["yes"]:
+        return apply_preview(len(argv) > 1 and argv[1] == "public")
+    project = argv[0] if argv else ""
+    found = workspace_map.load_map(vault)
+    match = None
+    for name, rule, folder in found.get("ships", []):
+        if not project or name.lower() == project.lower():
+            match = (name, rule, folder)
+            if project:
+                break
+    if project and (not match or match[0].lower() != project.lower()):
+        return f"Ship withheld: no rule for {project}."
+    if not match:
+        return "Ship withheld: no rule for this project."
+    name, rule, folder = match
+    if rule == "cerebro" and not publish_scan.maintainer_ready(vault, denylist_path()):
+        return publish_scan.MAINTAINER_MESSAGE
+    repo = folder
+    if not Path(repo).is_dir():
+        return f"Ship withheld: no folder for {name}."
+    text = preview(vault, repo, name, rule, folder)
+    if preview_path().is_file() and "Ship?" in text:
+        payload = json.loads(preview_path().read_text())
+        payload["vault"] = str(vault)
+        preview_path().write_text(json.dumps(payload))
+    return text
+
+
+def self_check():
+    import tempfile
+    env = os.environ
+    env["GIT_AUTHOR_NAME"] = "t"
+    env["GIT_COMMITTER_NAME"] = "t"
+    env["GIT_AUTHOR_EMAIL"] = "t" + "@" + "example.invalid"
+    env["GIT_COMMITTER_EMAIL"] = "t" + "@" + "example.invalid"
+    with tempfile.TemporaryDirectory() as raw:
+        root = Path(raw)
+        env["BRAIN_SHIP_PREVIEW"] = str(root / "ship-preview.json")
+        env["BRAIN_PR_FILE"] = str(root / "pr.md")
+        env["BRAIN_PUBLISH_DENYLIST"] = str(root / "deny")
+        (root / "deny").write_text("One\nTwo\nThree\n")
+        env["SHIP_SCHEDULED"] = "1"
+        if "scheduled" not in resolve([], root):
+            raise SystemExit("self-check: a scheduled run did not refuse")
+        env.pop("SHIP_SCHEDULED")
+        empty = root / "empty"
+        empty.mkdir()
+        before = {path.relative_to(empty).as_posix() for path in empty.rglob("*")}
+        (empty / "Workspace map.md").write_text(
+            "## Ship\n| Project | Rule | Folder |\n|---|---|---|\n| Kit | cerebro | /tmp/missing |\n"
+        )
+        withheld = resolve(["Kit"], empty)
+        after = {path.relative_to(empty).as_posix() for path in empty.rglob("*")}
+        if "Maintainer only" not in withheld or before != {p for p in after if p != "Workspace map.md"}:
+            raise SystemExit(f"self-check: cerebro ship created a file:\n{withheld}")
+        vault = root / "vault"
+        vault.mkdir()
+        (vault / "Workspace map.md").write_text("## Ship\n| Project | Rule | Folder |\n|---|---|---|\n")
+        if "no rule" not in resolve(["Missing"], vault):
+            raise SystemExit("self-check: a missing rule did not refuse")
+        files, dirs = [".gitignore"], [".github/"]
+        if not publish_scan.in_manifest(".gitignore", files, dirs):
+            raise SystemExit("self-check: .gitignore was not in the manifest")
+        if not publish_scan.in_manifest(".github/workflows/ci.yml", files, dirs):
+            raise SystemExit("self-check: .github/workflows/ci.yml was not in the manifest")
+        url = publish_scan.PUBLIC_REPO + "/actions"
+        if publish_scan.scan_text(url, ["fn" + "zh"]):
+            raise SystemExit("self-check: the public repo URL was scanned")
+        origin = root / "origin.git"
+        repo = root / "repo"
+        subprocess.run(["git", "init", "-q", "--bare", "-b", "main", str(origin)], check=True)
+        subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+        (repo / "README.md").write_text("hello\n")
+        (repo / "_Scripts").mkdir()
+        (repo / "_Scripts" / "starter-manifest.txt").write_text("README.md\n_Scripts/\nWork/Example/Example.md\n")
+        (repo / "Work" / "Example").mkdir(parents=True)
+        (repo / "Work" / "Example" / "Example.md").write_text("hub\n")
+        git(repo, "add", "README.md", "_Scripts/starter-manifest.txt", "Work/Example/Example.md")
+        git(repo, "commit", "-q", "-m", "start")
+        git(repo, "remote", "add", "origin", str(origin))
+        git(repo, "push", "-q", "-u", "origin", "main")
+        (vault / "Workspace map.md").write_text(
+            "## Maintainer\n- maintainer: yes\n\n## Ship\n"
+            "| Project | Rule | Folder |\n|---|---|---|\n"
+            f"| Example website | branch-pr | {repo} |\n"
+        )
+        (repo / "Personal").mkdir()
+        (repo / "Personal" / "note.md").write_text("secret\n")
+        git(repo, "add", "-f", "Personal/note.md")
+        env["BRAIN_SHIP_PUBLIC"] = "0"
+        env["BRAIN_SHIP_GH"] = "0"
+        reply = resolve(["Example website"], vault)
+        if "Personal/note.md" not in reply or "Ship?" in reply:
+            raise SystemExit(f"self-check: a private file was not blocked:\n{reply}")
+        git(repo, "rm", "-r", "--cached", "--quiet", "Personal")
+        subprocess.run(["git", "-C", str(repo), "clean", "-fd"], check=True)
+        (repo / "README.md").write_text("hello\nchanged " + "gh" + "p_" + "abcdefghij\n")
+        reply = resolve(["Example website"], vault)
+        if "****" not in reply or "Ship?" in reply:
+            raise SystemExit(f"self-check: a token was not blocked:\n{reply}")
+        (repo / "README.md").write_text("hello\nchanged\n")
+        (repo / "Work" / "Example" / "my-note.md").write_text("nope\n")
+        git(repo, "add", "-f", "Work/Example/my-note.md")
+        reply = resolve(["Example website"], vault)
+        if "Work/" not in reply or "Ship?" in reply:
+            raise SystemExit(f"self-check: a hub note was not blocked:\n{reply}")
+        git(repo, "rm", "-r", "--cached", "--quiet", "--", "Work/Example/my-note.md")
+        (repo / "Work" / "Example" / "my-note.md").unlink()
+        (repo / "Work" / "Example" / "Example.md").write_text("hub changed\n")
+        env["BRAIN_SHIP_PUBLIC"] = "1"
+        reply = resolve(["Example website"], vault)
+        if "fnsh ship yes public" not in reply:
+            raise SystemExit(f"self-check: a manifest file did not preview:\n{reply}")
+        before = git(repo, "rev-parse", "main").stdout.strip()
+        if "yes public" not in resolve(["yes"], vault):
+            raise SystemExit("self-check: a public repo accepted the first yes")
+        if git(repo, "rev-parse", "main").stdout.strip() != before:
+            raise SystemExit("self-check: the first yes moved main")
+        pushed = resolve(["yes", "public"], vault)
+        if "compare" not in pushed:
+            raise SystemExit(f"self-check: ship did not push:\n{pushed}")
+        if git(repo, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip() != "main":
+            raise SystemExit("self-check: branch-pr did not return to the start branch")
+        if git(repo, "rev-parse", "main").stdout.strip() != before:
+            raise SystemExit("self-check: branch-pr reset main")
+        stale = json.loads(preview_path().read_text())
+        stale["time"] = time.time() - PREVIEW_SECONDS - 5
+        preview_path().write_text(json.dumps(stale))
+        if "expired" not in resolve(["yes"], vault):
+            raise SystemExit("self-check: an expired preview was accepted")
+        if "reset --hard" in Path(__file__).read_text().split("def self_check", 1)[0]:
+            raise SystemExit("self-check: ship contains a hard reset")
+    print("self-check ok")
+
+
+def main(argv):
+    if argv and argv[0] == "self-check":
+        self_check()
+        return 0
+    # A quiet guard registration. Failures here must not block the refusal messages.
+    try:
+        import importlib.machinery
+        import importlib.util
+        path = Path(__file__).resolve().with_name("guard")
+        loader = importlib.machinery.SourceFileLoader("guard_script", str(path))
+        spec = importlib.util.spec_from_loader(loader.name, loader)
+        module = importlib.util.module_from_spec(spec)
+        loader.exec_module(module)
+        module.run(vault_root(), verbose=False)
+    except Exception:
+        pass
+    print(resolve(argv, vault_root()))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))
