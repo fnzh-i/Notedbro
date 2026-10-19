@@ -227,8 +227,8 @@ def check(vault=VAULT):
     return problems
 
 
-def cerebro_version():
-    path = Path(__file__).with_name("cerebro-version")
+def notedbro_version():
+    path = Path(__file__).with_name("notedbro-version")
     return path.read_text(errors="replace").strip() if path.is_file() else "0"
 
 
@@ -269,7 +269,7 @@ def main():
     if problems:
         print("\n".join(problems))
         raise SystemExit(1)
-    print(f"Vault ok. Cerebro v{cerebro_version()}.")
+    print(f"Vault ok. Notedbro v{notedbro_version()}.")
 
 
 if __name__ == "__main__":

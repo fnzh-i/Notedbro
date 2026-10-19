@@ -230,7 +230,7 @@ def scan(root, terms):
     return publish_scan.scan(
         root, terms, product=PRODUCT,
         allow_product_paths={
-            "DESIGN.md", "README.md", "Prefixes.md", "How to use the brain.md",
+            "CHANGELOG.md", "DESIGN.md", "README.md", "Prefixes.md", "How to use the brain.md",
             "_Config/bootstrap.md",
         },
         allowed_url=ALLOWED_URL,
@@ -341,7 +341,7 @@ def self_check():
         write(vault / "Workspace map.md", (
             "## Maintainer\n- maintainer: yes\n\n## Ship\n"
             "| Project | Rule | Folder |\n|---|---|---|\n"
-            f"| Example kit | cerebro | {out} |\n"
+            f"| Example kit | notedbro | {out} |\n"
         ))
 
         reply, ok = publish(vault, out, denylist)

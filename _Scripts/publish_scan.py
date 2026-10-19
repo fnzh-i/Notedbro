@@ -30,8 +30,8 @@ KNOWN_PRIVATE_TOP = {
     "Personal", "Work", "Collaboration", "Hackathons", "Research", "Plans",
     "Skill files", ".obsidian",
 }
-PUBLIC_REPO = "https://github.com/fnzh-i/Cerebro"
-PUBLIC_API = "https://api.github.com/repos/fnzh-i/Cerebro"
+PUBLIC_REPO = "https://github.com/fnzh-i/Notedbro"
+PUBLIC_API = "https://api.github.com/repos/fnzh-i/Notedbro"
 ALLOWED_URL = re.compile(
     "(?:" + re.escape(PUBLIC_REPO) + "|" + re.escape(PUBLIC_API) + ")"
     + r"[A-Za-z0-9/._#?=&-]*"
@@ -98,7 +98,7 @@ def maintainer_ready(vault, denylist):
     found = workspace_map.load_map(vault)
     if not found.get("maintainer"):
         return False
-    return any(rule == "cerebro" and folder for _project, rule, folder in found.get("ships", []))
+    return any(rule == "notedbro" and folder for _project, rule, folder in found.get("ships", []))
 
 
 def map_terms(vault):

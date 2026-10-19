@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fetch a newer Cerebro starter kit. The only commands that use the network."""
+"""Fetch a newer Notedbro starter kit. The only commands that use the network."""
 
 import importlib.machinery
 import importlib.util
@@ -25,14 +25,14 @@ def load_guard():
     loader.exec_module(module)
     return module
 
-API = "https://api.github.com/repos/fnzh-i/Cerebro/releases/latest"
+API = "https://api.github.com/repos/fnzh-i/Notedbro/releases/latest"
 UNIT_PREFIXES = ("_Scripts/",)
-UNIT_FILES = {".gitignore", "_Scripts/starter-manifest.txt", "_Scripts/cerebro-version"}
+UNIT_FILES = {".gitignore", "_Scripts/starter-manifest.txt", "_Scripts/notedbro-version"}
 OFFLINE = "Cannot reach GitHub. Try again later."
 
 
 def version_of(vault):
-    path = Path(vault) / "_Scripts" / "cerebro-version"
+    path = Path(vault) / "_Scripts" / "notedbro-version"
     if not path.is_file():
         return "0"
     return path.read_text(errors="replace").strip() or "0"
@@ -62,7 +62,7 @@ def release_tree():
     override = os.environ.get("BRAIN_RELEASE_DIR")
     if override:
         root = Path(override)
-        version = (root / "_Scripts" / "cerebro-version").read_text().strip()
+        version = (root / "_Scripts" / "notedbro-version").read_text().strip()
         return version, root, None
     try:
         with urllib.request.urlopen(API, timeout=10) as response:
@@ -95,7 +95,7 @@ def unit_files(source):
         for path in scripts.rglob("*"):
             if path.is_file() and "host-restore" not in path.parts:
                 found.append(path.relative_to(source).as_posix())
-    for name in (".gitignore", "_Scripts/starter-manifest.txt", "_Scripts/cerebro-version"):
+    for name in (".gitignore", "_Scripts/starter-manifest.txt", "_Scripts/notedbro-version"):
         if (Path(source) / name).is_file() and name not in found:
             found.append(name)
     return sorted(found)
@@ -107,8 +107,8 @@ def plan(vault):
     if version is None:
         return extra or OFFLINE, None
     if parse_version(version) <= parse_version(current):
-        return f"Cerebro is up to date (v{version}).", None
-    lines = [f"Your Cerebro is v{current}, latest is v{version}.", ""]
+        return f"Notedbro is up to date (v{version}).", None
+    lines = [f"Your Notedbro is v{current}, latest is v{version}.", ""]
     changes = []
     if tree is not None:
         for rel in unit_files(tree):
@@ -127,8 +127,8 @@ def check(vault):
     if version is None:
         return extra or OFFLINE
     if parse_version(version) <= parse_version(current):
-        return f"Cerebro is up to date (v{version})."
-    return f"Your Cerebro is v{current}, latest is v{version}. Run fnsh upgrade."
+        return f"Notedbro is up to date (v{version})."
+    return f"Your Notedbro is v{current}, latest is v{version}. Run fnsh upgrade."
 
 
 def apply_yes(vault):
@@ -176,7 +176,7 @@ def self_check():
         root = Path(raw)
         vault = root / "vault"
         (vault / "_Scripts").mkdir(parents=True)
-        (vault / "_Scripts" / "cerebro-version").write_text("1.2.0\n")
+        (vault / "_Scripts" / "notedbro-version").write_text("1.2.0\n")
         (vault / "_Scripts" / "starter-manifest.txt").write_text("README.md\n")
         (vault / ".gitignore").write_text("*\n")
         os.environ["BRAIN_UPGRADE_BACKUP"] = str(root / "backup")
@@ -201,7 +201,7 @@ def self_check():
             raise SystemExit(f"self-check: offline check wrote or failed: {reply}")
         release = root / "release"
         (release / "_Scripts").mkdir(parents=True)
-        (release / "_Scripts" / "cerebro-version").write_text("1.4.0\n")
+        (release / "_Scripts" / "notedbro-version").write_text("1.4.0\n")
         (release / "_Scripts" / "starter-manifest.txt").write_text("README.md\nextra\n")
         (release / "_Scripts" / "tool").write_text("new\n")
         (release / ".gitignore").write_text("*\n!*/\n")
@@ -237,7 +237,7 @@ def self_check():
             raise SystemExit(f"self-check: upgrade did not apply: {reply}")
         if "local" not in (vault / "_Scripts" / "starter-manifest.txt").read_text():
             raise SystemExit("self-check: a local manifest was overwritten")
-        if (vault / "_Scripts" / "cerebro-version").read_text().strip() != "1.4.0":
+        if (vault / "_Scripts" / "notedbro-version").read_text().strip() != "1.4.0":
             raise SystemExit("self-check: the version was not replaced")
         globals()["release_tree"] = real
     print("self-check ok")

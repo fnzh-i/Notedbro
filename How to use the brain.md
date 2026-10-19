@@ -21,7 +21,7 @@ A phrase starts with `fnsh`. It counts only at the start of a message or on its 
 - `fnsh prefs` — apply the rows in [[Preferences]] whose scope matches this chat.
 - `fnsh remember` — append one row to [[Preferences]]. The reply is `Saved to Preferences: <preference>`.
 - `fnsh plan save <name>` — write `Plans/<name>.md`. `fnsh plan load <name>` reads it as the working plan. `fnsh plan list` shows saved plans, newest first. It is its own line.
-- `fnsh check` — run `_Scripts/check-vault` and list problems. A clean run says `Vault ok. Cerebro v<version>.` It stays offline.
+- `fnsh check` — run `_Scripts/check-vault` and list problems. A clean run says `Vault ok. Notedbro v<version>.` It stays offline.
 - `fnsh shadow` — build a surface folder and an encrypted shadow copy. `fnsh shadow open` unpacks the newest copy. `fnsh shadow close` deletes that unpacked copy. `fnsh shadow list` prints the copies, newest first. It is its own line.
 - `fnsh guard` — record unknown top-level paths as private. It is its own line.
 - `fnsh ship` — open a pull request for the current project, after a preview and a yes. `fnsh ship <project>` names one. It never pushes `main`.

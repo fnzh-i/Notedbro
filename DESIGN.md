@@ -1,6 +1,6 @@
 # Design
 
-Cerebro is the starter kit. The vault it sets up is called Brain. This page explains three choices: living versus temporal notes, prefixes, and one card per chat.
+Notedbro is the starter kit. The vault it sets up is called Brain. This page explains three choices: living versus temporal notes, prefixes, and one card per chat.
 
 ## Living and temporal notes
 A living note is current truth. A project note, a hub, `Prefixes.md`, and `Parameters.md` are living: you edit them in place, and they say what is true now. A temporal note is a record of one moment. A session, a decision, a daily note, and a commit note are temporal: they are written once, dated, and left alone.

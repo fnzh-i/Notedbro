@@ -1,7 +1,7 @@
 # Security
 
 ## Reporting a problem
-Report a vulnerability through GitHub private vulnerability reporting: open the Security tab of https://github.com/fnzh-i/Cerebro and choose "Report a vulnerability". Do not open a public issue for it.
+Report a vulnerability through GitHub private vulnerability reporting: open the Security tab of https://github.com/fnzh-i/Notedbro and choose "Report a vulnerability". Do not open a public issue for it.
 
 ## Supported versions
 Only `main` is supported. Fixes land there.

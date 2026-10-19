@@ -3,7 +3,7 @@
 Read [Prerequisites](Prerequisites.md) first.
 
 1. **Clone** the repo into place:
-   `git clone https://github.com/fnzh-i/Cerebro ~/Documents/Brain`
+   `git clone https://github.com/fnzh-i/Notedbro ~/Documents/Brain`
 2. **Copy the example map:**
    `cp "Workspace map.example.md" "Workspace map.md"`, then replace the example company, ticket key, and folders with yours. Git ignores `Workspace map.md`.
 3. **Check the vault:** `python3 _Scripts/check-vault`. Expect `Vault ok.` If a host or harness file is missing, it prints the `fnsh rebuild <host>` line to run.

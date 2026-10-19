@@ -1,6 +1,6 @@
 # Contributing
 
-Pull requests go to https://github.com/fnzh-i/Cerebro.
+Pull requests go to https://github.com/fnzh-i/Notedbro.
 
 1. Branch from `main`. One change per pull request.
 2. Change only shared files: the shared notes, `AGENTS.md`, `CLAUDE.md`, the repo docs, `Hosts/`, `_Templates/`, `_Scripts/`, `.github/`, and `assets/`.

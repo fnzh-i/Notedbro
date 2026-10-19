@@ -51,7 +51,7 @@ Leave this out unless you keep a private vault and a public copy.
 ## Ship
 | Project | Rule | Folder |
 |---|---|---|
-| Example kit | cerebro | ~/.local/share/brain/publish |
+| Example kit | notedbro | ~/.local/share/brain/publish |
 | Example website | branch-pr | ~/Code/example-website |
 
 ## Project tags
