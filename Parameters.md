@@ -7,7 +7,7 @@ Standing rules for any model, in any project. Point a model at this note. Back t
 
 ## Parameters
 1. **No AI co-author.** Do not add a `Co-authored-by` trailer, or any other co-author credit, for Claude, Cursor, Codex, or any other AI model. Commits and pull requests name me only.
-2. **Git.** Double-check you're on a local feature branch, not `main` or `origin/main`. **Commit only.** No push, no PR (I do those). The commit message has a summary and a description, both based on the documentation report. The summary is one line drawn from the report. The description is drawn from the report body: what changed, the reason, files touched, and files not touched.
+2. **Git.** Double-check you're on a local feature branch, not `main` or `origin/main`. **Commit only.** No push, no PR (I do those). The one exception is `fnsh ship` followed by yes: that prefix may commit, push the feature branch, and open a pull request. It still never pushes `main`. The commit message has a summary and a description, both based on the documentation report. The summary is one line drawn from the report. The description is drawn from the report body: what changed, the reason, files touched, and files not touched.
 3. **Documentation report** (`.md`) after the changes: what changed, reason for the change, files touched, files not touched, etc. The report is not rewritten to match the commit.
 4. **Never mention Obsidian or my notes vault** in the report, test template, commits, PRs, Jira, announcements or the EOD summary.
 5. **Test cases and readback.**

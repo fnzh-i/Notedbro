@@ -1,0 +1,10 @@
+# Copy this file to ~/.config/brain/publish-denylist and replace every sample line.
+# One term per line. A line starting with # is a comment.
+# A term matches a whole word. A term ending in "-" is a case-sensitive prefix (a ticket key).
+# Categories to cover: employer, client names, ticket prefixes, your name, email, phone,
+# home folder, internal hostnames, key patterns.
+# The three SAMPLE lines below are not real. Delete them. Publish refuses a denylist that still has them.
+
+SAMPLE-EMPLOYER
+SAMPLE-CLIENT
+SAMPLE-NAME

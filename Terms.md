@@ -20,7 +20,7 @@ A filed note carries a type tag and an area tag. A project tag is added when the
 |---|---|
 | Vault | This folder. Long-term memory for work and personal projects. |
 | Area | One self-contained part of the vault. Its notes link to each other, and to [[Index]] to go home. A question may also link the code project it belongs to. |
-| Hub | The note that opens an area or a host: a company hub such as `Example`, [[Personal]], [[Collaboration]], [[Research]], [[Hackathons]], and the skill hubs `Skills`, `Claude skills`, `Codex skills`, `Cursor skills`. |
+| Hub | The note that opens an area or a host: a company hub such as `Example`, `Personal`, [[Collaboration]], [[Research]], [[Hackathons]], and the skill hubs `Skills`, `Claude skills`, `Codex skills`, `Cursor skills`. |
 | Project | One codebase or effort, with its own note, `Sessions/`, sometimes `Commits/`, and sometimes tickets. |
 | Description | The repo README on a project note. Goal stays one or two lines. No README means Goal is the description. |
 | Ticket | One tracker issue assigned to me. Files are `EX-NNN.md`, using the key in `Workspace map.md`. The prefix is `fnsh ticket <KEY>-NNN`. Closed unless that ticket is being continued. |

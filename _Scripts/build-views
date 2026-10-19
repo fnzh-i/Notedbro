@@ -12,7 +12,10 @@ import os
 import re
 import sys
 
-VAULT = os.path.realpath(os.path.expanduser(os.environ.get("BRAIN_VAULT", "~/Documents/Brain")))
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+from vault_path import vault_root  # noqa: E402
+
+VAULT = str(vault_root())
 CANVAS = "Decisions and sessions.canvas"
 SKIP = {".git", ".obsidian", "_Templates", "_Scripts", "_Config", "Skill files"}
 CARD_W = 440

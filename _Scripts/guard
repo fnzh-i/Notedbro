@@ -1,0 +1,188 @@
+#!/usr/bin/env python3
+"""Register unknown top-level paths as private in the .gitignore block.
+
+No network calls. Never deletes a file or runs git rm or git reset.
+"""
+
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import publish_scan  # noqa: E402
+from vault_path import vault_root  # noqa: E402
+
+START = "# >>> brain-guard"
+END = "# <<< brain-guard"
+LOCAL_LINE = "Ran locally. Nothing was sent anywhere."
+SKIP = {".git", ".DS_Store"}
+
+
+def known_private(name):
+    return name in publish_scan.KNOWN_PRIVATE_TOP or name == "Workspace map.md"
+
+
+def ship_folders(vault):
+    import workspace_map
+    found = workspace_map.load_map(vault)
+    folders = set()
+    for _project, _rule, folder in found.get("ships", []):
+        if not folder:
+            continue
+        path = Path(folder)
+        try:
+            rel = path.resolve().relative_to(Path(vault).resolve())
+        except ValueError:
+            continue
+        if rel.parts:
+            folders.add(rel.parts[0])
+    return folders
+
+
+def tracked(vault, rel):
+    result = subprocess.run(
+        ["git", "-C", str(vault), "ls-files", "--error-unmatch", "--", rel],
+        capture_output=True,
+    )
+    return result.returncode == 0
+
+
+def unknowns(vault):
+    files, dirs = publish_scan.read_manifest(vault)
+    projects = ship_folders(vault)
+    found = []
+    root = Path(vault)
+    if not root.is_dir():
+        return found
+    for path in sorted(root.iterdir(), key=lambda item: item.name):
+        if path.name in SKIP or path.name.startswith("."):
+            continue
+        rel = path.name + ("/" if path.is_dir() else "")
+        if known_private(path.name) or path.name in projects:
+            continue
+        if publish_scan.in_manifest(path.name, files, dirs) or publish_scan.in_manifest(rel, files, dirs):
+            continue
+        if path.is_dir() and any(item.startswith(path.name + "/") for item in files):
+            continue
+        found.append(path)
+    return found
+
+
+def note_like(vault, path):
+    if path.is_file() and path.suffix == ".md":
+        return True
+    if path.is_dir() and any(path.glob("*.md")):
+        return True
+    text = ""
+    for name in ("Workspace map.md", "Workspace map.example.md"):
+        candidate = Path(vault) / name
+        if candidate.is_file():
+            text += candidate.read_text(errors="replace")
+    return path.name in text
+
+
+def rewrite_block(gitignore, names):
+    text = gitignore.read_text(errors="replace") if gitignore.is_file() else ""
+    block = "\n".join([START, *names, END])
+    if START in text and END in text:
+        before, _, rest = text.partition(START)
+        _, _, after = rest.partition(END)
+        updated = before.rstrip() + "\n" + block + "\n" + after.lstrip("\n")
+    else:
+        updated = text.rstrip() + "\n" + block + "\n"
+    if updated != text:
+        gitignore.write_text(updated)
+        return True
+    return False
+
+
+def run(vault=None, verbose=False):
+    vault = Path(vault or vault_root())
+    paths = unknowns(vault)
+    gitignore = vault / ".gitignore"
+    existing = []
+    if gitignore.is_file() and START in gitignore.read_text(errors="replace"):
+        inside = gitignore.read_text(errors="replace").split(START, 1)[1].split(END, 1)[0]
+        existing = [line.strip() for line in inside.splitlines() if line.strip() and not line.strip().startswith("#")]
+    fresh = []
+    tracked_lines = []
+    note_lines = []
+    for path in paths:
+        rel = path.name + ("/" if path.is_dir() else "")
+        if rel not in existing:
+            fresh.append(rel)
+        if path.is_dir() and (vault / ".git").is_dir() and tracked(vault, path.name):
+            tracked_lines.append(
+                f"Already tracked: {rel}. Run git rm --cached {path.name} -r to stop tracking it."
+            )
+        elif note_like(vault, path):
+            note_lines.append(f"Looks like personal notes: {rel}. Kept out of git.")
+    changed = False
+    if fresh or existing:
+        names = []
+        for name in existing + fresh:
+            if name not in names:
+                names.append(name)
+        changed = rewrite_block(gitignore, names)
+    lines = []
+    if fresh:
+        shown = ", ".join(fresh)
+        lines.append(f"Registered as private: {shown}")
+    lines.extend(note_lines)
+    lines.extend(tracked_lines)
+    if verbose:
+        if not fresh and not tracked_lines:
+            lines.append("Nothing new. All unknown paths are already private.")
+        top = [path for path in vault.iterdir() if path.name not in SKIP and not path.name.startswith(".")]
+        lines.insert(0, f"Checked {len(top)} top-level paths. {len(fresh)} registered as private: {', '.join(fresh) if fresh else 'none'}. {len(tracked_lines)} already tracked.")
+    if lines or verbose:
+        lines.append(LOCAL_LINE)
+    return {"fresh": fresh, "unknown": [path.name for path in paths], "changed": changed, "text": "\n".join(lines)}
+
+
+def self_check():
+    import tempfile
+    with tempfile.TemporaryDirectory() as raw:
+        vault = Path(raw) / "vault"
+        vault.mkdir()
+        (vault / ".gitignore").write_text("*\n!*/\n!/README.md\n" + START + "\n" + END + "\n")
+        (vault / "README.md").write_text("ok\n")
+        (vault / "_Scripts").mkdir()
+        (vault / "_Scripts" / "starter-manifest.txt").write_text("README.md\n_Scripts/\n")
+        school = vault / "School"
+        school.mkdir()
+        (school / "note.md").write_text("hi\n")
+        first = run(vault, verbose=False)
+        if "School/" not in first["fresh"]:
+            raise SystemExit(f"self-check: School was not registered: {first}")
+        if "Looks like personal notes: School/" not in first["text"]:
+            raise SystemExit(f"self-check: note-like message missing: {first['text']}")
+        second = run(vault, verbose=True)
+        if second["fresh"] or second["changed"]:
+            raise SystemExit(f"self-check: a second run changed something: {second}")
+        if "Nothing new" not in second["text"] or LOCAL_LINE not in second["text"]:
+            raise SystemExit(f"self-check: summary missing: {second['text']}")
+        text = (vault / ".gitignore").read_text()
+        if text.count(START) != 1 or "School/" not in text.split(START, 1)[1].split(END, 1)[0]:
+            raise SystemExit("self-check: guard block was not kept")
+        banned = "reset " + "--hard"
+        body = Path(__file__).read_text().split("def self_check", 1)[0]
+        if banned in body:
+            raise SystemExit("self-check: guard contains a hard reset")
+    print("self-check ok")
+
+
+def main(argv):
+    if argv and argv[0] == "self-check":
+        self_check()
+        return 0
+    verbose = not argv or argv[0] != "--quiet"
+    result = run(verbose=verbose)
+    if result["text"]:
+        print(result["text"])
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))

@@ -23,6 +23,8 @@ def empty_map():
         "projects": [],
         "param_sets": {},
         "prefix_aliases": [],
+        "maintainer": False,
+        "ships": [],
     }
 
 
@@ -96,6 +98,13 @@ def parse(text):
     for row in table_rows(parts.get("prefix aliases", [])):
         if len(row) >= 2 and row[0] and row[1]:
             found["prefix_aliases"].append((row[0].lower(), row[1]))
+    for item in list_items(parts.get("maintainer", [])):
+        key, _, value = item.partition(":")
+        if key.strip().lower() == "maintainer" and value.strip().lower() == "yes":
+            found["maintainer"] = True
+    for row in table_rows(parts.get("ship", [])):
+        if len(row) >= 3 and row[0] and row[1]:
+            found["ships"].append((row[0], row[1].strip().lower(), expand(row[2])))
     return found
 
 

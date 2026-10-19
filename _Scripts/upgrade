@@ -1,0 +1,267 @@
+#!/usr/bin/env python3
+"""Fetch a newer Cerebro starter kit. The only commands that use the network."""
+
+import importlib.machinery
+import importlib.util
+import json
+import os
+import shutil
+import subprocess
+import sys
+import urllib.error
+import urllib.request
+from datetime import datetime
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from vault_path import vault_root  # noqa: E402
+
+
+def load_guard():
+    path = Path(__file__).resolve().with_name("guard")
+    loader = importlib.machinery.SourceFileLoader("guard_script", str(path))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+API = "https://api.github.com/repos/fnzh-i/Cerebro/releases/latest"
+UNIT_PREFIXES = ("_Scripts/",)
+UNIT_FILES = {".gitignore", "_Scripts/starter-manifest.txt", "_Scripts/cerebro-version"}
+OFFLINE = "Cannot reach GitHub. Try again later."
+
+
+def version_of(vault):
+    path = Path(vault) / "_Scripts" / "cerebro-version"
+    if not path.is_file():
+        return "0"
+    return path.read_text(errors="replace").strip() or "0"
+
+
+def parse_version(text):
+    parts = []
+    for piece in text.strip().lstrip("v").split("."):
+        digits = "".join(ch for ch in piece if ch.isdigit())
+        parts.append(int(digits or "0"))
+    return tuple(parts)
+
+
+def backup_root():
+    return Path(os.path.expanduser(os.environ.get(
+        "BRAIN_UPGRADE_BACKUP", "~/.local/share/brain/upgrade-backup"
+    )))
+
+
+def preview_path():
+    return Path(os.path.expanduser(os.environ.get(
+        "BRAIN_UPGRADE_PREVIEW", "~/.local/share/brain/upgrade-preview.json"
+    )))
+
+
+def release_tree():
+    override = os.environ.get("BRAIN_RELEASE_DIR")
+    if override:
+        root = Path(override)
+        version = (root / "_Scripts" / "cerebro-version").read_text().strip()
+        return version, root, None
+    try:
+        with urllib.request.urlopen(API, timeout=10) as response:
+            payload = json.loads(response.read().decode())
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, OSError):
+        return None, None, OFFLINE
+    version = str(payload.get("tag_name", "")).lstrip("v")
+    tarball = payload.get("tarball_url")
+    if not version or not tarball:
+        return None, None, OFFLINE
+    return version, None, tarball
+
+
+def locally_changed(vault, rel):
+    result = subprocess.run(
+        ["git", "-C", str(vault), "diff", "--quiet", "HEAD", "--", rel],
+        capture_output=True,
+    )
+    if result.returncode == 0:
+        return False
+    if result.returncode == 1:
+        return True
+    return False
+
+
+def unit_files(source):
+    found = []
+    scripts = Path(source) / "_Scripts"
+    if scripts.is_dir():
+        for path in scripts.rglob("*"):
+            if path.is_file() and "host-restore" not in path.parts:
+                found.append(path.relative_to(source).as_posix())
+    for name in (".gitignore", "_Scripts/starter-manifest.txt", "_Scripts/cerebro-version"):
+        if (Path(source) / name).is_file() and name not in found:
+            found.append(name)
+    return sorted(found)
+
+
+def plan(vault):
+    current = version_of(vault)
+    version, tree, extra = release_tree()
+    if version is None:
+        return extra or OFFLINE, None
+    if parse_version(version) <= parse_version(current):
+        return f"Cerebro is up to date (v{version}).", None
+    lines = [f"Your Cerebro is v{current}, latest is v{version}.", ""]
+    changes = []
+    if tree is not None:
+        for rel in unit_files(tree):
+            status = "locally changed" if locally_changed(vault, rel) else "replace"
+            changes.append({"path": rel, "status": status})
+            lines.append(f"- {rel}: {status}")
+    lines.append("")
+    lines.append("Upgrade? fnsh upgrade yes")
+    payload = {"version": version, "source": str(tree) if tree else extra, "changes": changes, "vault": str(vault)}
+    return "\n".join(lines), payload
+
+
+def check(vault):
+    current = version_of(vault)
+    version, _tree, extra = release_tree()
+    if version is None:
+        return extra or OFFLINE
+    if parse_version(version) <= parse_version(current):
+        return f"Cerebro is up to date (v{version})."
+    return f"Your Cerebro is v{current}, latest is v{version}. Run fnsh upgrade."
+
+
+def apply_yes(vault):
+    path = preview_path()
+    if not path.is_file():
+        return "Upgrade withheld: no preview."
+    payload = json.loads(path.read_text())
+    source = Path(payload["source"])
+    if not source.is_dir():
+        return OFFLINE
+    stamp = datetime.now().strftime("%Y-%m-%d-%H%M%S")
+    backup = backup_root() / stamp
+    backup.mkdir(parents=True, exist_ok=True)
+    written = []
+    try:
+        for item in payload["changes"]:
+            rel = item["path"]
+            if item["status"] == "locally changed":
+                continue
+            if rel == "Workspace map.md" or rel.startswith("Personal/"):
+                continue
+            src = source / rel
+            dest = Path(vault) / rel
+            if dest.is_file():
+                kept = backup / rel
+                kept.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(dest, kept)
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src, dest)
+            written.append(dest)
+        load_guard().run(vault, verbose=False)
+    except Exception as error:
+        for dest in written:
+            rel = dest.relative_to(vault)
+            kept = backup / rel
+            if kept.is_file():
+                shutil.copy2(kept, dest)
+        return f"Upgrade withheld: {error}"
+    return f"Upgraded to v{payload['version']}."
+
+
+def self_check():
+    import tempfile
+    with tempfile.TemporaryDirectory() as raw:
+        root = Path(raw)
+        vault = root / "vault"
+        (vault / "_Scripts").mkdir(parents=True)
+        (vault / "_Scripts" / "cerebro-version").write_text("1.2.0\n")
+        (vault / "_Scripts" / "starter-manifest.txt").write_text("README.md\n")
+        (vault / ".gitignore").write_text("*\n")
+        os.environ["BRAIN_UPGRADE_BACKUP"] = str(root / "backup")
+        os.environ["BRAIN_UPGRADE_PREVIEW"] = str(root / "preview.json")
+        os.environ["BRAIN_RELEASE_API_OFF"] = "1"
+        os.environ.pop("BRAIN_RELEASE_DIR", None)
+        before = list(vault.rglob("*"))
+        # No release dir and a closed port stands in for a dead network.
+        os.environ["BRAIN_RELEASE_DIR"] = str(root / "missing-release")
+        # missing dir is an error inside release_tree only if we require the file.
+        # Use an unreachable override by pointing at a file, not a directory.
+        os.environ.pop("BRAIN_RELEASE_DIR")
+        real = release_tree
+
+        def down():
+            return None, None, OFFLINE
+
+        globals()["release_tree"] = down
+        reply = check(vault)
+        after = list(vault.rglob("*"))
+        if reply != OFFLINE or before != after:
+            raise SystemExit(f"self-check: offline check wrote or failed: {reply}")
+        release = root / "release"
+        (release / "_Scripts").mkdir(parents=True)
+        (release / "_Scripts" / "cerebro-version").write_text("1.4.0\n")
+        (release / "_Scripts" / "starter-manifest.txt").write_text("README.md\nextra\n")
+        (release / "_Scripts" / "tool").write_text("new\n")
+        (release / ".gitignore").write_text("*\n!*/\n")
+
+        def up():
+            return "1.4.0", release, None
+
+        globals()["release_tree"] = up
+        seen = check(vault)
+        if "v1.2.0" not in seen or "v1.4.0" not in seen:
+            raise SystemExit(f"self-check: versions were not both shown: {seen}")
+        if list(vault.rglob("*")) != after:
+            raise SystemExit("self-check: upgrade check wrote a file")
+        text, payload = plan(vault)
+        if payload is None or "fnsh upgrade yes" not in text:
+            raise SystemExit(f"self-check: upgrade did not ask: {text}")
+        preview_path().write_text(json.dumps(payload))
+        # A dirty manifest is skipped.
+        (vault / ".gitignore").write_text("")
+        subprocess.run(["git", "init", "-q", "-b", "main", str(vault)], check=True)
+        subprocess.run(["git", "-C", str(vault), "add", "-A"], check=True)
+        env = dict(os.environ)
+        env.update(GIT_AUTHOR_NAME="t", GIT_COMMITTER_NAME="t",
+                   GIT_AUTHOR_EMAIL="t" + "@" + "example.invalid", GIT_COMMITTER_EMAIL="t" + "@" + "example.invalid")
+        subprocess.run(["git", "-C", str(vault), "commit", "-q", "-m", "base"], check=True, env=env)
+        (vault / "_Scripts" / "starter-manifest.txt").write_text("README.md\nlocal\n")
+        text, payload = plan(vault)
+        preview_path().write_text(json.dumps(payload))
+        if not any(item["path"].endswith("starter-manifest.txt") and item["status"] == "locally changed" for item in payload["changes"]):
+            raise SystemExit(f"self-check: a local edit was not skipped: {payload}")
+        reply = apply_yes(vault)
+        if not reply.startswith("Upgraded"):
+            raise SystemExit(f"self-check: upgrade did not apply: {reply}")
+        if "local" not in (vault / "_Scripts" / "starter-manifest.txt").read_text():
+            raise SystemExit("self-check: a local manifest was overwritten")
+        if (vault / "_Scripts" / "cerebro-version").read_text().strip() != "1.4.0":
+            raise SystemExit("self-check: the version was not replaced")
+        globals()["release_tree"] = real
+    print("self-check ok")
+
+
+def main(argv):
+    vault = vault_root()
+    if argv and argv[0] == "self-check":
+        self_check()
+        return 0
+    if argv and argv[0] == "check":
+        print(check(vault))
+        return 0
+    if argv and argv[0] == "yes":
+        print(apply_yes(vault))
+        return 0
+    text, payload = plan(vault)
+    if payload:
+        path = preview_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(payload))
+    print(text)
+    return 0 if text != OFFLINE else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))

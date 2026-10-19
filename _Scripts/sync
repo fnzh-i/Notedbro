@@ -7,6 +7,8 @@ run never copies scripts. A file changed on both sides is withheld.
 """
 
 import difflib
+import importlib.machinery
+import importlib.util
 import os
 import plistlib
 import shutil
@@ -15,7 +17,11 @@ import sys
 import tempfile
 from pathlib import Path
 
-VAULT = Path(os.path.realpath(os.path.expanduser(os.environ.get("BRAIN_VAULT", "~/Documents/Brain"))))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import publish_scan  # noqa: E402
+from vault_path import vault_root  # noqa: E402
+
+VAULT = vault_root()
 CHECKOUT = Path(os.path.expanduser(os.environ.get("BRAIN_PUBLISH_DIR", "~/.local/share/brain/publish")))
 SHA_FILE = Path(os.path.expanduser(os.environ.get("BRAIN_SYNC_SHA", "~/.config/brain/sync-sha")))
 
@@ -79,7 +85,25 @@ def regenerate_bootstrap(vault):
     subprocess.run([sys.executable, str(script)], env=env, capture_output=True, check=True)
 
 
-def sync(vault=VAULT, checkout=CHECKOUT, sha_file=SHA_FILE, scheduled=False, out=print):
+def _guard():
+    path = Path(__file__).resolve().with_name("guard")
+    loader = importlib.machinery.SourceFileLoader("guard_script", str(path))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+def sync(vault=VAULT, checkout=CHECKOUT, sha_file=SHA_FILE, scheduled=False, out=print, require_maintainer=True):
+    denylist = Path(os.path.expanduser(os.environ.get("BRAIN_PUBLISH_DENYLIST", "~/.config/brain/publish-denylist")))
+    if require_maintainer and not publish_scan.maintainer_ready(vault, denylist):
+        return publish_scan.MAINTAINER_MESSAGE
+    if require_maintainer:
+        found = _guard().run(vault, verbose=False)
+        if found["text"]:
+            out(found["text"])
+        if scheduled and found["unknown"]:
+            return "Sync withheld: unknown files"
     if not (checkout / ".git").is_dir():
         return f"Sync withheld: no checkout at {checkout}"
     if git(checkout, "status", "--porcelain").stdout.strip():
@@ -169,6 +193,11 @@ def self_check():
         raise SystemExit("self-check: git is required")
     with tempfile.TemporaryDirectory() as raw:
         root = Path(raw)
+        empty = root / "empty"
+        empty.mkdir()
+        refused = sync(empty, root / "missing-checkout", root / "sha", scheduled=True)
+        if publish_scan.MAINTAINER_MESSAGE not in refused or (root / "missing-checkout").exists():
+            raise SystemExit(f"self-check: sync did not refuse a non-maintainer:\n{refused}")
         env = dict(os.environ)
         env.update(GIT_AUTHOR_NAME="t", GIT_COMMITTER_NAME="t",
                    GIT_AUTHOR_EMAIL="t" + "@" + "example.invalid", GIT_COMMITTER_EMAIL="t" + "@" + "example.invalid")
@@ -210,7 +239,7 @@ def self_check():
             target.write_text(text if rel != "Index.md" else "live index\n")
 
         def run(scheduled):
-            return sync(vault, checkout, sha_file, scheduled=scheduled, out=lambda _text: None)
+            return sync(vault, checkout, sha_file, scheduled=scheduled, out=lambda _text: None, require_maintainer=False)
 
         first = run(True)
         if not first.startswith("Synced: "):
@@ -233,7 +262,7 @@ def self_check():
         if run(True) != "Sync waiting: scripts changed" or (vault / "_Scripts" / "tool").read_text() != "v1\n":
             raise SystemExit("self-check: a scheduled run copied a script")
         shown = []
-        reply = sync(vault, checkout, sha_file, scheduled=False, out=shown.append)
+        reply = sync(vault, checkout, sha_file, scheduled=False, out=shown.append, require_maintainer=False)
         if not reply.startswith("Synced: ") or (vault / "_Scripts" / "tool").read_text() != "v2\n":
             raise SystemExit(f"self-check: a hand run did not copy the script: {reply}")
         if not any("main/_Scripts/tool" in text for text in shown):
