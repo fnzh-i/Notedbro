@@ -31,3 +31,13 @@ Passed locally on macOS with Python 3.9.6:
 The code is a release candidate. GitHub's Template repository setting remains disabled and must be enabled before promoting the private-template journey. Upstream macOS/Linux CI, actual Claude/Cursor hook delivery, a real Codex manual-filing walkthrough, and a private-template-copy test still require recording. Claude and Cursor executables were not available in this local environment. No remote settings, branches, pull requests, tags, or releases were changed.
 
 Customized runtime files are preserved and flagged. Version promotion requires the shipped runtime bytes; unresolved custom runtime changes must be reviewed before finishing migration. This is deliberately stricter than trusting a version label.
+
+## CI follow-up: deterministic publication fixtures
+
+Reproduced the exported-release smoke failure with the hosted account name: the privacy scanner interpreted ordinary CI expressions and documentation mentioning that account as private login-name disclosures. The original failing assertion was the exported tree's content scan, not setup or migration.
+
+The exported-release test and publication self-check now use a synthetic fixture identity and home directory. The smoke test always simulates the hosted account first, so local runs cover this regression. Scan failures print every finding, and a separate regression test confirms both tree and text scans still reject planted home paths and login names. Production privacy scanning is unchanged.
+
+Files touched: `_Scripts/check-onboarding`, `_Scripts/publish`, the regenerated `_Scripts/release-runtime.sha256`, and this report. No user content, host configuration, workflow permissions, historical checksums, or production scanner rules changed.
+
+Validation on macOS/Python 3.9.6: all 24 onboarding tests passed, including a separate full-suite run simulating the hosted account; all repository validators and six script self-checks passed; all 75 historical hashes verified. The hosted Actions matrix still needs a rerun after this local commit is pushed.

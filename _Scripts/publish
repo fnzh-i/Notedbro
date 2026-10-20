@@ -324,6 +324,16 @@ def ignored(repo, rel):
 
 
 def self_check():
+    # The public fixture is not authored by the current machine account. Keep
+    # its privacy identity deterministic without changing real publication scans.
+    from unittest.mock import patch
+    with tempfile.TemporaryDirectory() as fixture_home:
+        with patch.object(publish_scan.getpass, "getuser", return_value="fixture-" + "private-login"), \
+                patch.object(Path, "home", return_value=Path(fixture_home)):
+            _self_check()
+
+
+def _self_check():
     with tempfile.TemporaryDirectory() as raw:
         root = Path(raw)
         vault = root / "vault"

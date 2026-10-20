@@ -186,13 +186,19 @@ class Onboarding(unittest.TestCase):
         selected, _ = pub.included(self.root)
         self.assertFalse(any(str(p) in (".claude/settings.local.json", ".claude/hooks/notedbro.py") or str(p).startswith(".notedbro-local/") for p in selected))
 
-    def test_exported_release_smoke(self):
+    @patch("getpass.getuser", return_value="run" + "ner")
+    def test_exported_release_smoke(self, _machine_account):
         self.run_setup("claude")
         pub = module(self.root / "_Scripts/publish")
         exported = self.base / "exported release"
         self.assertEqual(pub.build_tree(self.root, exported), [])
         self.assertEqual(pub.check_tree(exported), [])
-        self.assertEqual(pub.scan(exported, []), [])
+        # Fixture scans must not mistake a machine's generic account name for
+        # private content (for example, CI's account matches workflow expressions).
+        with patch.object(pub.publish_scan.getpass, "getuser", return_value="fixture-" + "private-login"), \
+                patch.object(Path, "home", return_value=self.home):
+            findings = pub.scan(exported, [])
+        self.assertEqual(findings, [], "Exported release scan findings:\n" + "\n".join(findings))
         self.assertFalse((exported / ".claude/settings.local.json").exists())
         self.assertFalse((exported / ".notedbro-local").exists())
         self.assertFalse(migration.runtime_problems(exported, SOURCE))
@@ -200,6 +206,22 @@ class Onboarding(unittest.TestCase):
         result = subprocess.run([sys.executable, str(exported / "_Scripts/setup"), "web", "home", str(self.home)], env=env, capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("No browser connection", result.stdout)
+
+    def test_publication_scan_preserves_private_identity_checks(self):
+        pub = module(self.root / "_Scripts/publish")
+        private_login = "fixture-" + "private-login"
+        exported = self.base / "private scan fixture"
+        exported.mkdir()
+        text = str(self.home / "notes") + "\n" + private_login + "\n"
+        (exported / "example.md").write_text(text)
+        with patch.object(pub.publish_scan.getpass, "getuser", return_value=private_login), \
+                patch.object(Path, "home", return_value=self.home):
+            self.assertEqual(pub.scan(exported, []), [
+                "example.md:1: home folder", "example.md:2: login name",
+            ])
+            self.assertEqual(pub.publish_scan.scan_text(text, []), [
+                "1: home folder", "2: login name",
+            ])
 
     def test_ci_guard_regression(self):
         checker = module(self.root / "_Scripts/check-docs")
