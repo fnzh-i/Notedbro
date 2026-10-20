@@ -114,6 +114,8 @@ def included(vault):
     for name in files:
         if name in GENERATED:
             continue
+        if publish_scan.is_private_path(name):
+            continue
         if (vault / name).is_file():
             found.append(Path(name))
         else:
@@ -125,7 +127,7 @@ def included(vault):
             continue
         for path in iter_files(root):
             rel = path.relative_to(vault)
-            if set(rel.parts) & EXCLUDE_PARTS or path.is_symlink():
+            if set(rel.parts) & EXCLUDE_PARTS or path.is_symlink() or publish_scan.is_private_path(rel.as_posix()):
                 continue
             found.append(rel)
     return found, missing
@@ -183,6 +185,9 @@ def gitignore_text(vault=None):
     lines += [
         "/_Scripts/host-restore/",
         "/Workspace map.md",
+        "/.claude/settings.local.json",
+        "/.claude/hooks/notedbro.py",
+        "/.notedbro-local/",
         "*.canvas",
         "*.jsonl",
         ".DS_Store",
@@ -232,6 +237,10 @@ def scan(root, terms):
         allow_product_paths={
             "CHANGELOG.md", "DESIGN.md", "README.md", "Prefixes.md", "How to use the brain.md",
             "_Config/bootstrap.md",
+            "How to set up.md", "Prerequisites.md", "SECURITY.md", "CONTRIBUTING.md",
+            "Advanced configuration.md", "Maintainer guide.md", "Troubleshooting.md",
+            "Migration 1.1.0.md", "Release 1.1.0.md", "Change report 1.1.0.md",
+            ".github/workflows/ci.yml", "Hosts/Web.md",
         },
         allowed_url=ALLOWED_URL,
     )
@@ -315,6 +324,16 @@ def ignored(repo, rel):
 
 
 def self_check():
+    # The public fixture is not authored by the current machine account. Keep
+    # its privacy identity deterministic without changing real publication scans.
+    from unittest.mock import patch
+    with tempfile.TemporaryDirectory() as fixture_home:
+        with patch.object(publish_scan.getpass, "getuser", return_value="fixture-" + "private-login"), \
+                patch.object(Path, "home", return_value=Path(fixture_home)):
+            _self_check()
+
+
+def _self_check():
     with tempfile.TemporaryDirectory() as raw:
         root = Path(raw)
         vault = root / "vault"

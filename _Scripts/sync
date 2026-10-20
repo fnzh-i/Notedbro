@@ -26,6 +26,9 @@ CHECKOUT = Path(os.path.expanduser(os.environ.get("BRAIN_PUBLISH_DIR", "~/.local
 SHA_FILE = Path(os.path.expanduser(os.environ.get("BRAIN_SYNC_SHA", "~/.config/brain/sync-sha")))
 
 SHARED_FILES = {
+    "Advanced configuration.md", "Maintainer guide.md", "Troubleshooting.md",
+    "Migration 1.1.0.md", "Release 1.1.0.md", "Change report 1.1.0.md",
+    "Workspace map.advanced.example.md",
     "How this vault works.md", "How to use the brain.md", "Prefixes.md", "Parameters.md",
     "Preferences.md", "Hosts.md", "Terms.md", "Graph colors.md",
     "AGENTS.md", "CLAUDE.md",

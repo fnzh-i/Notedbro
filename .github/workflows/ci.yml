@@ -16,11 +16,13 @@ concurrency:
 
 jobs:
   validate:
+    if: github.repository == 'fnzh-i/Notedbro'
     name: validate (${{ matrix.python-version }})
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
+        os: [ubuntu-latest, macos-latest]
         python-version:
           - "3.9"
           - "3.15"
@@ -30,6 +32,8 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
 
       - name: Set up Python
         uses: actions/setup-python@v7
@@ -37,9 +41,20 @@ jobs:
           python-version: ${{ matrix.python-version }}
 
       - name: Install system dependencies
+        if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install --yes age zstd
+
+      - name: Install macOS backup dependencies
+        if: runner.os == 'macOS'
+        run: brew install age zstd
+
+      - name: Check onboarding and migration
+        run: |
+          python _Scripts/check-onboarding
+          python _Scripts/check-docs
+          python _Scripts/check-migration verify-baseline
 
       - name: Run repository validators
         run: |

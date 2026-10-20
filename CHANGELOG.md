@@ -2,6 +2,7 @@
 
 One dated line per pull request, newest first. Written in the pull request; sync never writes it.
 
+- 2026-10-20 — Added 1.1.0 private-template onboarding, local Claude hooks, deterministic migration checksums, duplicate filing protection, and guarded CI for template copies.
 - 2026-10-19 — Distinguished an unpublished release from a GitHub connection failure in `fnsh upgrade check`, and restored direct execution for `upgrade` and `guard`.
 - 2026-10-19 — Generalized the shipped preferences and parameters into public starter defaults and linked the plan, ticket, and commit templates to them.
 - 2026-10-19 — Presented the included preferences and parameters as usable public starter defaults that each user can keep, edit, or remove.

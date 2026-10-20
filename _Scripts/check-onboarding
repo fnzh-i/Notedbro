@@ -1,0 +1,422 @@
+#!/usr/bin/env python3
+"""Exercise public setup and migration in disposable exported installations."""
+import importlib.machinery
+import importlib.util
+import json
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+import tempfile
+import unittest
+from unittest.mock import patch
+
+SOURCE = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(SOURCE / "_Scripts"))
+import migration
+import onboarding
+
+
+def module(path):
+    loader = importlib.machinery.SourceFileLoader("fixture_" + path.name.replace("-", "_"), str(path))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    return mod
+
+
+class Onboarding(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.base = Path(self.tmp.name).resolve()
+        self.root = self.base / "Brain with spaces"
+        def ignored(directory, names):
+            found = shutil.ignore_patterns(".git", "__pycache__", ".claude", ".notedbro-local", "*.canvas", "host-restore")(directory, names)
+            if Path(directory) == SOURCE:
+                found.add("Workspace map.md")
+            return found
+        shutil.copytree(SOURCE, self.root, ignore=ignored)
+        self.home = self.base / "test home"
+        self.home.mkdir()
+        self.env = dict(os.environ, BRAIN_VAULT=str(self.root), BRAIN_HOME=str(self.home))
+        self.env.pop("CLAUDE_CONFIG_DIR", None)
+
+    def run_setup(self, host, expected=0):
+        p = subprocess.run([sys.executable, str(self.root / "_Scripts/setup"), host, "home", str(self.home)], env=self.env, capture_output=True, text=True)
+        self.assertEqual(p.returncode, expected, p.stdout + p.stderr)
+        return p.stdout
+
+    def state(self):
+        return {str(p): (p.read_bytes(), p.stat().st_mtime_ns) for top in (self.root, self.home) for p in top.rglob("*") if p.is_file() and "__pycache__" not in p.parts}
+
+    def test_hosts_and_repeat(self):
+        for host in ("claude", "cursor", "codex", "web"):
+            with self.subTest(host=host):
+                output = self.run_setup(host)
+                if host == "web":
+                    self.assertIn("No browser connection or automatic filing was configured.", output)
+                    self.assertNotIn("Configuration installed", output)
+                before = self.state()
+                self.run_setup(host)
+                self.assertEqual(before, self.state())
+        parsed = module(self.root / "_Scripts/workspace_map.py").load_map(self.root)
+        self.assertFalse(parsed["company"])
+        self.assertFalse(parsed["ticket_key"])
+        self.assertFalse(parsed["ships"])
+        self.assertFalse(parsed["maintainer"])
+        self.assertEqual(json.loads((self.root / "Decisions and sessions.canvas").read_text()), {"nodes": [], "edges": []})
+        self.assertFalse((self.home / ".claude/settings.json").exists())
+        self.assertFalse((self.home / ".claude/CLAUDE.md").exists())
+
+    def test_preserve_and_repair(self):
+        local = self.root / ".claude/settings.local.json"
+        local.parent.mkdir()
+        obj = {"permissions": {"deny": ["Bash(example)"]}, "hooks": {"SessionEnd": [{"hooks": [{"type": "command", "command": "echo other"}]}]}}
+        local.write_text(json.dumps(obj))
+        shared = local.with_name("settings.json")
+        shared.write_text('{"model":"example"}\n')
+        old = self.home / ".codex/AGENTS.md"
+        old.parent.mkdir()
+        old.write_text("Custom start\n<!-- brain:start -->\nRead Templates/Session.md and Scripts/file-session.\n<!-- brain:end -->\nCustom end\n")
+        custom = self.root / "Workspace map.md"
+        custom.write_text("---\ntags: [meta]\n---\n# Custom map\n")
+        self.run_setup("codex")
+        self.run_setup("claude")
+        after = json.loads(local.read_text())
+        self.assertEqual(after["permissions"], obj["permissions"])
+        self.assertEqual(len(after["hooks"]["SessionEnd"]), 2)
+        self.assertEqual(shared.read_text(), '{"model":"example"}\n')
+        self.assertEqual(custom.read_text(), "---\ntags: [meta]\n---\n# Custom map\n")
+        self.assertIn("_Templates/Session.md", old.read_text())
+        self.assertIn("Custom end", old.read_text())
+        self.assertTrue(list((self.root / ".notedbro-local/backups").rglob("AGENTS.md")))
+
+    def test_web_leaves_host_configuration_alone(self):
+        path = self.home / ".codex/AGENTS.md"
+        path.parent.mkdir()
+        text = "<!-- brain:start -->\nRead Templates/Session.md\n<!-- brain:end -->\n"
+        path.write_text(text)
+        self.run_setup("web")
+        self.assertEqual(path.read_text(), text)
+        self.assertFalse((self.home / ".cursor").exists())
+        self.assertFalse((self.root / ".claude/settings.local.json").exists())
+
+    def test_broken_settings(self):
+        path = self.root / ".claude/settings.local.json"
+        path.parent.mkdir()
+        path.write_text("{broken")
+        output = self.run_setup("claude", 1)
+        self.assertIn("Setup incomplete", output)
+        self.assertEqual(path.read_text(), "{broken")
+
+    def test_custom_wrapper_and_symlink_preserved(self):
+        path = self.root / ".claude/hooks/notedbro.py"
+        path.parent.mkdir(parents=True)
+        path.write_text("# user hook\n")
+        self.assertIn("Custom hook", self.run_setup("claude", 1))
+        self.assertEqual(path.read_text(), "# user hook\n")
+        path.unlink()
+        outside = self.base / "outside-settings"
+        outside.write_text("{}")
+        (self.root / ".claude/settings.local.json").symlink_to(outside)
+        self.assertIn("Symlink destination", self.run_setup("claude", 1))
+        self.assertEqual(outside.read_text(), "{}")
+
+    def test_custom_legacy_wrapper_is_not_executed(self):
+        path, _ = self.global_hook(self.root / "_Scripts/file-session")
+        marker = self.base / "must-not-exist"
+        path.write_text(path.read_text() + f'\nopen({str(marker)!r}, "w").write("executed")\n')
+        self.assertIn("custom wrapper cannot be verified", self.run_setup("claude", 1))
+        self.assertFalse(marker.exists())
+
+    def test_manifest_rejects_traversal(self):
+        path = self.base / "invalid.sha256"
+        path.write_text("0" * 64 + "  ../outside\n")
+        with self.assertRaises(ValueError):
+            migration.read_manifest(path)
+
+    def test_example_map_is_not_ready(self):
+        path = self.root / "Workspace map.md"
+        path.write_text((self.root / "Workspace map.advanced.example.md").read_text())
+        before = path.read_bytes()
+        self.assertIn("Example routing is still active", self.run_setup("web", 1))
+        self.assertEqual(path.read_bytes(), before)
+
+    def test_exact_quoted_identifiers(self):
+        self.run_setup("claude")
+        mod = module(self.root / "_Scripts/file-session")
+        mod.VAULT = str(self.root)
+        with patch.dict(os.environ, self.env):
+            for sid in ('case: "quoted"', 'case: "quoted"-suffix'):
+                args = mod.parse_args(["--host", "codex", "--conversation", sid, "--manual"])
+                self.assertEqual(mod.file_session(args), 0)
+                self.assertEqual(mod.file_session(args), 0)
+        self.assertEqual(len(list((self.root / "Personal/Chats/Sessions").glob("*.md"))), 2)
+
+    def test_tracked_private_settings(self):
+        subprocess.run(["git", "init", "-q", str(self.root)], check=True)
+        local = self.root / ".claude/settings.local.json"
+        local.parent.mkdir()
+        local.write_text("{}")
+        subprocess.run(["git", "-C", str(self.root), "add", "-f", ".claude/settings.local.json"], check=True)
+        self.assertIn("is tracked", self.run_setup("claude", 1))
+        self.assertEqual(local.read_text(), "{}")
+
+    def test_missing_ignore_rules_stop_before_personal_writes(self):
+        (self.root / ".gitignore").unlink()
+        self.assertIn(".gitignore is missing", self.run_setup("claude", 1))
+        self.assertFalse((self.root / "Workspace map.md").exists())
+        self.assertFalse((self.root / ".claude/settings.local.json").exists())
+
+    def test_private_publication_and_staging(self):
+        self.run_setup("claude")
+        subprocess.run(["git", "init", "-q", str(self.root)], check=True)
+        subprocess.run(["git", "-C", str(self.root), "add", "."], check=True)
+        names = subprocess.check_output(["git", "-C", str(self.root), "ls-files"]).decode()
+        self.assertNotIn(".claude/settings.local.json", names)
+        self.assertNotIn(".notedbro-local/", names)
+        pub = module(self.root / "_Scripts/publish")
+        selected, missing = pub.included(self.root)
+        self.assertFalse(any(str(p).startswith((".claude/", ".notedbro-local/")) for p in selected))
+        # An erroneous future manifest must still not publish generated local settings.
+        manifest = self.root / "_Scripts/starter-manifest.txt"
+        manifest.write_text(manifest.read_text() + ".claude/\n.notedbro-local/\n")
+        selected, _ = pub.included(self.root)
+        self.assertFalse(any(str(p) in (".claude/settings.local.json", ".claude/hooks/notedbro.py") or str(p).startswith(".notedbro-local/") for p in selected))
+
+    @patch("getpass.getuser", return_value="run" + "ner")
+    def test_exported_release_smoke(self, _machine_account):
+        self.run_setup("claude")
+        pub = module(self.root / "_Scripts/publish")
+        exported = self.base / "exported release"
+        self.assertEqual(pub.build_tree(self.root, exported), [])
+        self.assertEqual(pub.check_tree(exported), [])
+        # Fixture scans must not mistake a machine's generic account name for
+        # private content (for example, CI's account matches workflow expressions).
+        with patch.object(pub.publish_scan.getpass, "getuser", return_value="fixture-" + "private-login"), \
+                patch.object(Path, "home", return_value=self.home):
+            findings = pub.scan(exported, [])
+        self.assertEqual(findings, [], "Exported release scan findings:\n" + "\n".join(findings))
+        self.assertFalse((exported / ".claude/settings.local.json").exists())
+        self.assertFalse((exported / ".notedbro-local").exists())
+        self.assertFalse(migration.runtime_problems(exported, SOURCE))
+        env = dict(self.env, BRAIN_VAULT=str(exported))
+        result = subprocess.run([sys.executable, str(exported / "_Scripts/setup"), "web", "home", str(self.home)], env=env, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("No browser connection", result.stdout)
+
+    def test_publication_scan_preserves_private_identity_checks(self):
+        pub = module(self.root / "_Scripts/publish")
+        private_login = "fixture-" + "private-login"
+        exported = self.base / "private scan fixture"
+        exported.mkdir()
+        text = str(self.home / "notes") + "\n" + private_login + "\n"
+        (exported / "example.md").write_text(text)
+        with patch.object(pub.publish_scan.getpass, "getuser", return_value=private_login), \
+                patch.object(Path, "home", return_value=self.home):
+            self.assertEqual(pub.scan(exported, []), [
+                "example.md:1: home folder", "example.md:2: login name",
+            ])
+            self.assertEqual(pub.publish_scan.scan_text(text, []), [
+                "1: home folder", "2: login name",
+            ])
+
+    def test_ci_guard_regression(self):
+        checker = module(self.root / "_Scripts/check-docs")
+        workflow = self.root / ".github/workflows/ci.yml"
+        self.assertFalse(checker.check(self.root))
+        workflow.write_text(workflow.read_text().replace("    if: github.repository == 'fnzh-i/Notedbro'\n", ""))
+        self.assertTrue(any("upstream-only job guard" in error for error in checker.check(self.root)))
+
+    def test_readme_quick_start_commands(self):
+        import re, shlex
+        subprocess.run(["git", "init", "-q", str(self.root)], check=True)
+        subprocess.run(["git", "-C", str(self.root), "add", "."], check=True)
+        address = "fixture" + "@" + "example.invalid"
+        env = dict(self.env, GIT_AUTHOR_NAME="Fixture", GIT_COMMITTER_NAME="Fixture", GIT_AUTHOR_EMAIL=address, GIT_COMMITTER_EMAIL=address)
+        subprocess.run(["git", "-C", str(self.root), "commit", "-qm", "Release fixture"], env=env, check=True)
+        script = re.search(r"```bash\n(.*?)```", (self.root / "README.md").read_text(), re.S).group(1)
+        script = script.replace("https://github.com/YOUR-ACCOUNT/Brain.git", shlex.quote(str(self.root)))
+        script = script.replace("~/Documents", shlex.quote(str(self.home / "Documents")))
+        env.pop("BRAIN_VAULT", None)
+        result = subprocess.run(["bash", "-e", "-c", script], cwd=str(self.base), env=env, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        cloned = self.home / "Documents/Brain"
+        self.assertTrue((cloned / "Workspace map.md").is_file())
+        self.assertEqual((cloned / "_Scripts/notedbro-version").read_text(), "1.1.0\n")
+        self.assertEqual(subprocess.check_output(["git", "-C", str(cloned), "remote", "get-url", "origin"]).decode().strip(), str(self.root))
+
+    def global_hook(self, filer, kind="legacy"):
+        path = self.home / ".claude/hooks/brain-reminder.py"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        loader = module(self.root / "_Scripts/load-host")
+        # Exact v1.0.0 wrapper shape with a statically resolvable relocated filer.
+        text = loader.THIN_HOOK.format(kind="Session-end", hook="claude")
+        text = text.replace('os.path.expanduser("~/Documents/Brain/_Scripts/file-session")', repr(str(filer)))
+        path.write_text(text)
+        settings = self.home / ".claude/settings.json"
+        settings.write_text(json.dumps({"hooks": {"SessionEnd": [{"hooks": [{"type": "command", "command": "python3 -I " + __import__('shlex').quote(str(path))}]}]}}))
+        return path, settings
+
+    def test_legacy_old_other_installation_blocks(self):
+        old = self.base / "old Brain/_Scripts/file-session"
+        old.parent.mkdir(parents=True)
+        old.write_text("# old implementation\n")
+        _, settings = self.global_hook(old)
+        before = settings.read_bytes()
+        output = self.run_setup("claude", 1)
+        self.assertIn("Legacy hook migration required", output)
+        self.assertIn(str(old), output)
+        self.assertEqual(settings.read_bytes(), before)
+
+    def test_local_legacy_hook_and_environment_destination_block(self):
+        other = self.base / "old Brain/_Scripts/file-session"
+        other.parent.mkdir(parents=True)
+        other.write_text("# old filer\n")
+        path, settings = self.global_hook(other)
+        local = self.root / ".claude/settings.local.json"
+        local.parent.mkdir()
+        local.write_bytes(settings.read_bytes())
+        settings.unlink()
+        self.assertIn("Legacy hook migration required", self.run_setup("claude", 1))
+        # A current filer plus a redirected destination still fails inspection.
+        command = "env BRAIN_VAULT=" + __import__('shlex').quote(str(self.base / 'other')) + " python3 " + __import__('shlex').quote(str(self.root / '_Scripts/file-session')) + " --hook claude"
+        with self.assertRaises(ValueError):
+            onboarding.inspect_hook(command, self.root, self.home)
+
+    def test_current_filer_symlink_is_resolved(self):
+        alias = self.base / "alias-filer"
+        alias.symlink_to(self.root / "_Scripts/file-session")
+        self.global_hook(alias)
+        self.assertIn("Duplicate delivery protected", self.run_setup("claude"))
+
+    def transcript(self, sid="session-one"):
+        path = self.base / "transcript.jsonl"
+        path.write_text(json.dumps({"type": "user", "message": {"role": "user", "content": "fnsh brain\nPlease create a small example file"}}) + "\n" + json.dumps({"type": "assistant", "message": {"role": "assistant", "content": [{"type": "tool_use", "name": "Write", "input": {"path": str(self.root / "example.md")}}]}}) + "\n")
+        return json.dumps({"session_id": sid, "transcript_path": str(path), "cwd": str(self.root)})
+
+    def test_global_local_concurrent_delivery(self):
+        legacy, settings = self.global_hook(self.root / "_Scripts/file-session")
+        before = settings.read_bytes()
+        self.assertIn("Duplicate delivery protected", self.run_setup("claude"))
+        self.assertEqual(settings.read_bytes(), before)
+        current = self.root / ".claude/hooks/notedbro.py"
+        payload = self.transcript('quoted-session')
+        processes = [subprocess.Popen([sys.executable, str(p)], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=self.env) for p in (legacy, current)]
+        for process in processes:
+            process.stdin.write(payload)
+            process.stdin.close()
+            process.stdin = None
+        for process in processes:
+            out, err = process.communicate(timeout=30)
+            self.assertEqual(process.returncode, 0, out + err)
+        for hook in (legacy, current):
+            replay = subprocess.run([sys.executable, str(hook)], input=payload, env=self.env, capture_output=True, text=True)
+            self.assertEqual(replay.returncode, 0, replay.stderr)
+        notes = list((self.root / "Personal/Chats/Sessions").glob("*.md"))
+        self.assertEqual(len(notes), 1)
+        self.assertEqual(notes[0].read_text().count('conversation: quoted-session'), 1)
+        index = (self.root / "Personal/Chats/Chats sessions.md").read_text()
+        self.assertEqual(index.count("[[" + notes[0].stem + "]]"), 1)
+        daily = list((self.root / "Personal/Daily").glob("*.md"))
+        self.assertEqual(len(daily), 1)
+        self.assertEqual(daily[0].read_text().count('quoted-session'), 1)
+
+    def test_failure_releases_lock_and_repair(self):
+        self.run_setup("claude")
+        mod = module(self.root / "_Scripts/file-session")
+        mod.VAULT = str(self.root)
+        args = mod.parse_args(["--host", "codex", "--conversation", "retry-case", "--manual"])
+        old = mod.ensure_index
+        def fail(*_):
+            raise RuntimeError("injected index failure")
+        mod.ensure_index = fail
+        with patch.dict(os.environ, self.env):
+            with self.assertRaises(RuntimeError):
+                mod.file_session(args)
+            mod.ensure_index = old
+            self.assertEqual(mod.file_session(args), 0)
+        self.assertEqual(len(list((self.root / "Personal/Chats/Sessions").glob("*.md"))), 1)
+        self.assertTrue((self.root / "Personal/Chats/Chats sessions.md").is_file())
+
+    def test_codex_transcript_first_session(self):
+        self.run_setup("codex")
+        transcript = self.base / "codex.jsonl"
+        events = [
+            {"type": "response_item", "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "# AGENTS.md instructions for /example\nIgnore this metadata"}]}},
+            {"type": "event_msg", "payload": {"type": "user_message", "message": "Create a checklist for my sample project"}},
+            {"type": "response_item", "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "Create a checklist for my sample project"}]}},
+            {"type": "turn_context", "payload": {"model": "example-model"}},
+            {"type": "response_item", "payload": {"type": "custom_tool_call", "name": "functions.apply_patch", "input": "*** Begin Patch\n*** Add File: /example/checklist.md\n+Checklist\n*** End Patch"}},
+        ]
+        transcript.write_text("\n".join(json.dumps(row) for row in events) + "\n")
+        result = subprocess.run([sys.executable, str(self.root / "_Scripts/file-session"), "--host", "codex", "--conversation", "codex-first", "--transcript", str(transcript), "--manual"], env=self.env, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        card = next((self.root / "Personal/Chats/Sessions").glob("*.md")).read_text()
+        self.assertIn("Create a checklist", card)
+        self.assertIn("Edited checklist.md.", card)
+        self.assertIn("model: example-model", card)
+        self.assertNotIn("Ignore this metadata", card)
+        self.assertEqual(len(list((self.root / "Personal/Daily").glob("*.md"))), 1)
+
+    def test_checksum_states_and_safety(self):
+        old = self.base / "existing"
+        old.mkdir()
+        stock = subprocess.run(["git", "-C", str(SOURCE), "archive", migration.BASE_COMMIT], capture_output=True)
+        if stock.returncode:
+            self.skipTest("Historical Git objects not available; run verify-baseline in full checkout")
+        import io, tarfile
+        with tarfile.open(fileobj=io.BytesIO(stock.stdout)) as archive:
+            archive.extractall(old)
+        before = (old / "Parameters.md").read_bytes()
+        rows = migration.compare(old)
+        self.assertIn("stock v1.0.0", {r["state"] for r in rows})
+        self.assertIn("already current", {r["state"] for r in rows})
+        self.assertIn("missing", {r["state"] for r in rows})
+        tool = old / "_Scripts/guard"
+        tool.write_text(tool.read_text() + "# custom\n")
+        (old / "_Scripts/custom-script").write_text("custom")
+        (old / "_Scripts/upgrade").unlink()
+        (old / "_Scripts/upgrade").symlink_to(SOURCE / "_Scripts/upgrade")
+        rows = migration.compare(old)
+        states = {r["path"]: r for r in rows}
+        self.assertEqual(states["_Scripts/guard"]["state"], "modified")
+        self.assertEqual(states["_Scripts/upgrade"]["state"], "unknown")
+        self.assertEqual(states["_Scripts/custom-script"]["state"], "unknown")
+        self.assertEqual((old / "Parameters.md").read_bytes(), before)
+        self.assertFalse(states["Parameters.md"]["copy"])
+        self.assertFalse(states["_Scripts/notedbro-version"]["copy"])
+
+    def test_stock_migration_and_version_gate(self):
+        old = self.base / "v100"
+        old.mkdir()
+        archive = subprocess.run(["git", "-C", str(SOURCE), "archive", migration.BASE_COMMIT], capture_output=True)
+        if archive.returncode:
+            self.skipTest("Historical Git objects unavailable")
+        import io, tarfile
+        with tarfile.open(fileobj=io.BytesIO(archive.stdout)) as tree:
+            tree.extractall(old)
+        (old / "Workspace map.md").write_text("---\ntags: [meta]\n---\n# My routing\n")
+        params = (old / "Parameters.md").read_bytes()
+        for row in migration.compare(old):
+            if row["copy"]:
+                destination = old / row["path"]
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(SOURCE / row["path"], destination)
+        env = dict(self.env, BRAIN_VAULT=str(old))
+        result = subprocess.run([sys.executable, str(SOURCE / "_Scripts/setup"), "claude", "home", str(self.home)], env=env, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual((old / "_Scripts/notedbro-version").read_text(), "1.1.0\n")
+        self.assertEqual((old / "Parameters.md").read_bytes(), params)
+        self.assertEqual((old / "Workspace map.md").read_text(), "---\ntags: [meta]\n---\n# My routing\n")
+        (old / "_Scripts/notedbro-version").write_text("1.0.0\n")
+        (old / "_Scripts/file-session").write_text("# unresolved custom filer\n")
+        result = subprocess.run([sys.executable, str(SOURCE / "_Scripts/setup"), "claude", "home", str(self.home)], env=env, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual((old / "_Scripts/notedbro-version").read_text(), "1.0.0\n")
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

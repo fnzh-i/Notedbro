@@ -157,7 +157,7 @@ Brain/
 - Personal files I own (`~/.claude/CLAUDE.md`, and my Cursor user rule) may have old vault steps removed once.
 - To remove the brain, delete the text between the markers, and delete the hook line.
 - Hooks never edit config files. The filer never edits config files. It may write inside `_Scripts/host-restore/` after a session is filed.
-- `_Scripts/load-host` may write personal host files when I say `fnsh load <host>`. A file that is already there is left alone. A dangling symlink is replaced. The folder `_Scripts/host-restore/` may contain secrets. It is listed in the vault `.gitignore` and in Excluded files. Move it between machines by hand. Do not commit it and do not sync it.
+- `_Scripts/load-host` restores supported missing files. Claude uses only Brain's `.claude/settings.local.json` and the generated local hook; start Claude at Brain's root. Shared and global settings are preserved. Recognized obsolete paths can be repaired with backups. Custom or malformed configuration requires review. Local settings, generated hooks, `.notedbro-local/`, and `_Scripts/host-restore/` remain private and must never be published.
 - A company rule and a brain rule in conflict are raised with me first. The brain wins only when I say `fnsh wins`. Asking about a conflict is allowed.
 - Stay silent about the vault in repo files, commits, pull requests, Jira, end-of-day notes, and chat replies, unless I ask about it.
 
@@ -188,6 +188,7 @@ Brain/
 Keyword search is enough. Revisit semantic search when keyword search misses a note that exists, or the vault passes about 1,000 notes. Count content notes only, not files under `Skill files/`. Do not build it before then.
 
 ## Revisions
+- 2026-10-20 — added 1.1.0 local Claude setup, backed-up instruction repair, and private generated configuration.
 - 2026-10-17 — added Plans/, the plan type, and fnsh plan.
 - 2026-10-18 — added Collaboration for shared projects and per-project routing.
 - 2026-10-18 — graph colors prioritize recorded host/model, AI family, and host, with gray for session cards lacking provenance.
