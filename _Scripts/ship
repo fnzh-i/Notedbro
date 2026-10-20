@@ -122,6 +122,9 @@ def classify(vault, repo, names, project_folder):
     root = Path(project_folder).resolve() if project_folder else None
     repo_root = Path(repo).resolve()
     for rel in names:
+        if rel in {".claude/settings.local.json", ".claude/hooks/notedbro.py"} or rel.startswith(".notedbro-local/"):
+            private.append(rel)
+            continue
         if publish_scan.is_private_path(rel) and not publish_scan.in_manifest(rel, files, dirs):
             private.append(rel)
             continue

@@ -20,6 +20,9 @@ MAINTAINER_MESSAGE = (
 DENYLIST_MESSAGE = "Edit your denylist first. It still has the sample words."
 SHORT_DENYLIST = "Edit your denylist first. It needs at least three terms that are not samples."
 PRIVATE_PREFIXES = (
+    ".notedbro-local/",
+    ".claude/settings.local.json",
+    ".claude/hooks/notedbro.py",
     "Personal/",
     "Plans/",
     "Skill files/",
@@ -29,6 +32,7 @@ PRIVATE_PREFIXES = (
 KNOWN_PRIVATE_TOP = {
     "Personal", "Work", "Collaboration", "Hackathons", "Research", "Plans",
     "Skill files", ".obsidian",
+    ".notedbro-local",
 }
 PUBLIC_REPO = "https://github.com/fnzh-i/Notedbro"
 PUBLIC_API = "https://api.github.com/repos/fnzh-i/Notedbro"

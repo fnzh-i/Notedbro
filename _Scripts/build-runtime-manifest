@@ -1,0 +1,17 @@
+#!/usr/bin/env python3
+"""Generate the current release's runtime checksums from the starter include list."""
+from pathlib import Path
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import migration
+
+root = Path(__file__).resolve().parent.parent
+lines = ["# Notedbro 1.1.0 runtime checksums. Regenerate after changing shipped runtime files."]
+for rel, path in sorted(migration.release_files(root).items()):
+    if rel.startswith("_Scripts/") and path.suffix != ".sha256":
+        lines.append(migration.sha(path) + "  " + rel)
+output = root / "_Scripts/release-runtime.sha256"
+data = "\n".join(lines) + "\n"
+if not output.exists() or output.read_text() != data:
+    output.write_text(data)
+print(f"Runtime checksums: {len(lines) - 1} files")
