@@ -50,6 +50,8 @@ jobs:
 
       - name: Run script self-checks
         run: |
+          _Scripts/guard self-check
+          _Scripts/upgrade self-check
           python _Scripts/publish self-check
           python _Scripts/sync self-check
           python _Scripts/rebuild self-check
