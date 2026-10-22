@@ -114,9 +114,9 @@ def included(vault):
     for name in files:
         if name in GENERATED:
             continue
-        if publish_scan.is_private_path(name):
-            continue
-        if (vault / name).is_file():
+        if (vault / name).is_symlink():
+            missing.append(name + " (symlink refused)")
+        elif (vault / name).is_file():
             found.append(Path(name))
         else:
             missing.append(name)
@@ -127,7 +127,7 @@ def included(vault):
             continue
         for path in iter_files(root):
             rel = path.relative_to(vault)
-            if set(rel.parts) & EXCLUDE_PARTS or path.is_symlink() or publish_scan.is_private_path(rel.as_posix()):
+            if set(rel.parts) & EXCLUDE_PARTS or path.name.startswith("._") or path.is_symlink():
                 continue
             found.append(rel)
     return found, missing
@@ -185,9 +185,6 @@ def gitignore_text(vault=None):
     lines += [
         "/_Scripts/host-restore/",
         "/Workspace map.md",
-        "/.claude/settings.local.json",
-        "/.claude/hooks/notedbro.py",
-        "/.notedbro-local/",
         "*.canvas",
         "*.jsonl",
         ".DS_Store",
@@ -236,11 +233,7 @@ def scan(root, terms):
         root, terms, product=PRODUCT,
         allow_product_paths={
             "CHANGELOG.md", "DESIGN.md", "README.md", "Prefixes.md", "How to use the brain.md",
-            "_Config/bootstrap.md",
-            "How to set up.md", "Prerequisites.md", "SECURITY.md", "CONTRIBUTING.md",
-            "Advanced configuration.md", "Maintainer guide.md", "Troubleshooting.md",
-            "Migration 1.1.0.md", "Release 1.1.0.md", "Change report 1.1.0.md",
-            ".github/workflows/ci.yml", "Hosts/Web.md",
+            "_Config/bootstrap.md", ".github/workflows/ci.yml",
         },
         allowed_url=ALLOWED_URL,
     )
@@ -324,16 +317,6 @@ def ignored(repo, rel):
 
 
 def self_check():
-    # The public fixture is not authored by the current machine account. Keep
-    # its privacy identity deterministic without changing real publication scans.
-    from unittest.mock import patch
-    with tempfile.TemporaryDirectory() as fixture_home:
-        with patch.object(publish_scan.getpass, "getuser", return_value="fixture-" + "private-login"), \
-                patch.object(Path, "home", return_value=Path(fixture_home)):
-            _self_check()
-
-
-def _self_check():
     with tempfile.TemporaryDirectory() as raw:
         root = Path(raw)
         vault = root / "vault"
@@ -351,6 +334,17 @@ def _self_check():
         write(vault / "_Scripts" / "host-restore" / "claude" / "CLAUDE.md", "keep out\n")
         diary = "Di" + "ary"
         write(vault / "Personal" / f"{diary}.md", "---\ntags: [personal]\n---\n# Private\n")
+        fake_pat = "github" + "_pat_" + "abcdefghij"
+        write(vault / "Personal" / "ship-token-example.md", "token: " + fake_pat + "\n")
+        if not any("GitHub token" in hit and fake_pat not in hit for hit in publish_scan.vault_token_hits(vault)):
+            raise SystemExit("self-check: fine-grained token scanner missed a private file")
+        external = root / "fake-managed-token"
+        external.write_text(fake_pat)
+        try:
+            (vault / "_Scripts" / "managed-token-link").symlink_to(external)
+        except OSError:
+            if os.name != "nt":
+                raise
         write(vault / "Index.md", "---\ntags: [meta]\n---\n# Live index\n")
 
         bare = root / "bare-out"
@@ -359,15 +353,25 @@ def _self_check():
             raise SystemExit(f"self-check: missing maintainer setup did not refuse cleanly:\n{reply}")
         write(vault / "Workspace map.md", (
             "## Maintainer\n- maintainer: yes\n\n## Ship\n"
-            "| Project | Rule | Folder |\n|---|---|---|\n"
-            f"| Example kit | notedbro | {out} |\n"
+            "| Project | Rule | Folder | Base |\n|---|---|---|---|\n"
+            f"| Example kit | notedbro | {out} | main |\n"
         ))
 
         reply, ok = publish(vault, out, denylist)
         if not ok or reply != f"Published: {shown(out)}":
             raise SystemExit(f"self-check: clean publish failed:\n{reply}")
+        prefix_file = out / "Prefixes.md"
+        original_prefixes = prefix_file.read_bytes()
+        try:
+            prefix_file.write_bytes(original_prefixes + b"\n")
+            if not any("stale bootstrap" in problem for problem in check_tree(out)):
+                raise SystemExit("self-check: stale bootstrap source was not detected")
+        finally:
+            prefix_file.write_bytes(original_prefixes)
         names = {path.relative_to(out).as_posix() for path in iter_files(out)}
         for rel in names:
+            if rel.endswith("managed-token-link") or rel.endswith("ship-token-example.md"):
+                raise SystemExit("self-check: managed token material was published")
             if rel.startswith("_Scripts/host-restore/"):
                 raise SystemExit(f"self-check: {rel} was published")
             if rel.startswith("Personal/") and rel not in ("Personal/Personal.md", "Personal/Chats/Chats.md"):
@@ -420,6 +424,10 @@ def _self_check():
                 raise SystemExit(f"self-check: {word!r} matched a term inside a word")
         if not scan_text_hits("fnsh " + "ci" + "si params", ["ci" + "si"]):
             raise SystemExit("self-check: a standalone term was missed")
+        if publish_scan.scan_text(publish_scan.PUBLIC_SLUG, ["fn" + "zh"]):
+            raise SystemExit("self-check: the public repository identifier was withheld")
+        if not publish_scan.scan_text("fn" + "zh-i/Other", ["fn" + "zh"]):
+            raise SystemExit("self-check: the public identifier exception was too broad")
 
         noise = vault / "assets" / "branding" / "noise.png"
         noise.parent.mkdir(parents=True, exist_ok=True)

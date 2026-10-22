@@ -1,18 +1,13 @@
 # Prerequisites
 
-For automated local setup:
+Required:
+- Git
+- Python 3 (for the scripts only; the notes work without it)
+- On Windows, use `py _Scripts/<script>` (or `python _Scripts/<script>`); on macOS/Linux, use `python3 _Scripts/<script>`.
+- Obsidian or another markdown editor
 
-- Git: verify in Terminal with `git --version`.
-- Python 3.9 or later: verify with `python3 --version`.
-- One installed local tool: Claude Code, Cursor, or Codex.
-- A GitHub account to create the recommended private template copy.
+Optional:
+- Cursor, Claude Code, or Codex, to file chats automatically or with `fnsh update`
+- age and zstd, for `fnsh shadow` encrypted backups (`brew install age zstd`)
 
-Any Markdown editor works. Obsidian is optional. Browser-only users can read and manually fill the Markdown templates without running scripts.
-
-Install Git from [git-scm.com](https://git-scm.com/downloads) and Python from [python.org](https://www.python.org/downloads/), or use your operating system's package manager. Finish prerequisites before the quick start.
-
-macOS is the primary local environment. Portable setup, migration, and filing are covered by macOS/Linux CI. Native Windows and WSL are unverified; LaunchAgent scheduling requires macOS. CI cannot prove that every installed AI-host version emits the expected events: complete the actual-host verification in the setup guide.
-
-Optional encrypted backups require age and zstd. On macOS install them in Terminal with `brew install age zstd`. Installing dependencies uses the network.
-
-Scripts discover Brain from their installed folder, or BRAIN_VAULT when explicitly supplied. Generated hooks remember the selected location. If you move Brain, rerun setup and review legacy-hook findings. The default instructions use ~/Documents/Brain.
+The scripts default to `~/Documents/Brain`. To use a clone somewhere else, set `BRAIN_VAULT` to its path, for example `export BRAIN_VAULT=~/notes/Brain`. The Cursor and Claude hooks call `~/Documents/Brain/_Scripts/file-session`, so cloning to `~/Documents/Brain` is the simplest choice.

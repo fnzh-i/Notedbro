@@ -20,9 +20,6 @@ MAINTAINER_MESSAGE = (
 DENYLIST_MESSAGE = "Edit your denylist first. It still has the sample words."
 SHORT_DENYLIST = "Edit your denylist first. It needs at least three terms that are not samples."
 PRIVATE_PREFIXES = (
-    ".notedbro-local/",
-    ".claude/settings.local.json",
-    ".claude/hooks/notedbro.py",
     "Personal/",
     "Plans/",
     "Skill files/",
@@ -32,24 +29,27 @@ PRIVATE_PREFIXES = (
 KNOWN_PRIVATE_TOP = {
     "Personal", "Work", "Collaboration", "Hackathons", "Research", "Plans",
     "Skill files", ".obsidian",
-    ".notedbro-local",
 }
 PUBLIC_REPO = "https://github.com/fnzh-i/Notedbro"
 PUBLIC_API = "https://api.github.com/repos/fnzh-i/Notedbro"
+PUBLIC_SLUG = PUBLIC_REPO.split("github.com/", 1)[1]
 ALLOWED_URL = re.compile(
     "(?:" + re.escape(PUBLIC_REPO) + "|" + re.escape(PUBLIC_API) + ")"
-    + r"[A-Za-z0-9/._#?=&-]*"
+    + r"[A-Za-z0-9/._#?=&-]*|(?<![A-Za-z0-9/._-])"
+    + re.escape(PUBLIC_SLUG) + r"(?![A-Za-z0-9._-])"
 )
 
 
 def token_patterns():
     """Built at runtime so this file does not contain a live secret shape."""
     ghp = "gh" + "p_"
+    fine = "github" + "_pat_"
     sk = "s" + "k-"
     akia = "AK" + "IA"
     header = "-----BEGIN " + "PRIVATE KEY-----"
     return (
-        (re.compile(re.escape(ghp) + r"[A-Za-z0-9]{8,}"), "token", ghp),
+        (re.compile(re.escape(fine) + r"[A-Za-z0-9_]{8,}"), "GitHub token", "none"),
+        (re.compile(re.escape(ghp) + r"[A-Za-z0-9]{8,}"), "GitHub token", "none"),
         (re.compile(re.escape(sk) + r"[A-Za-z0-9]{8,}"), "token", sk),
         (re.compile(re.escape(akia) + r"[A-Z0-9]{8,}"), "token", akia),
         (re.compile(re.escape(header)), "private key", "key"),
@@ -57,6 +57,8 @@ def token_patterns():
 
 
 def mask(value, prefix):
+    if prefix == "none":
+        return "****"
     if prefix == "key":
         return "-----BEGIN ****"
     shown = value[: len(prefix)]
@@ -123,7 +125,7 @@ def map_terms(vault):
 def iter_files(root):
     root = Path(root)
     for dirpath, dirnames, filenames in os.walk(root):
-        dirnames[:] = sorted(name for name in dirnames if name != ".git")
+        dirnames[:] = sorted(name for name in dirnames if name not in {".git", "__pycache__"})
         for name in sorted(filenames):
             yield Path(dirpath) / name
 
@@ -171,6 +173,8 @@ def scan(root, terms, product="", allow_product_paths=(), allowed_url=None):
     allowed = set(allow_product_paths)
     hits = []
     for path in iter_files(root):
+        if path.is_symlink():
+            continue
         rel = path.relative_to(root).as_posix()
         if path.suffix.lower() in IMAGE_SUFFIXES:
             continue
@@ -202,6 +206,39 @@ def scan_text(text, terms, allowed_url=None):
 
 def scan_text_hits(text, terms):
     return [term for term in terms if term_pattern(term).search(text)]
+
+
+def vault_token_hits(root):
+    """Find GitHub token shapes in local files without printing any token bytes."""
+    root = Path(root)
+    patterns = [pattern for pattern, label, _prefix in token_patterns() if label == "GitHub token"]
+    hits = []
+    try:
+        import ship_token
+        managed = ship_token.token_path()
+    except RuntimeError:
+        managed = None
+    for path in iter_files(root):
+        if path.is_symlink() or path.suffix.lower() in IMAGE_SUFFIXES:
+            continue
+        rel = path.relative_to(root).as_posix()
+        if managed and managed.exists():
+            try:
+                if os.path.samefile(path, managed):
+                    hits.append(f"{rel}: managed Ship token file alias")
+                    continue
+            except OSError:
+                continue
+        try:
+            data = path.read_bytes()
+        except OSError:
+            continue
+        if b"\0" in data:
+            continue
+        for line_number, line in enumerate(data.decode("utf-8", errors="replace").splitlines(), 1):
+            if any(pattern.search(line) for pattern in patterns):
+                hits.append(f"{rel}:{line_number}: GitHub token")
+    return hits
 
 
 def manifest_path(vault):

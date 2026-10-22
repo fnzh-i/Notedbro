@@ -11,6 +11,7 @@
 !/_Templates/**
 !/assets/
 !/assets/**
+!/.gitattributes
 !/AGENTS.md
 !/CHANGELOG.md
 !/CLAUDE.md
@@ -52,16 +53,6 @@
 !/Personal/Chats/Chats.md
 /_Scripts/host-restore/
 /Workspace map.md
-/.claude/settings.local.json
-/.claude/hooks/notedbro.py
-/.notedbro-local/
-!/Workspace map.advanced.example.md
-!/Advanced configuration.md
-!/Maintainer guide.md
-!/Troubleshooting.md
-!/Migration 1.1.0.md
-!/Release 1.1.0.md
-!/Change report 1.1.0.md
 *.canvas
 *.jsonl
 .DS_Store
@@ -71,5 +62,4 @@
 shadow.key
 __pycache__/
 # >>> brain-guard
-report.md
 # <<< brain-guard

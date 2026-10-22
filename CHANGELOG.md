@@ -2,9 +2,8 @@
 
 One dated line per pull request, newest first. Written in the pull request; sync never writes it.
 
-- 2026-10-22 — Made GitHub CLI optional for Ship with secure token-backed PR calls, pre-push duplicate checks, and explicit base and report safeguards.
-
-- 2026-10-20 — Added 1.1.0 private-template onboarding, local Claude hooks, deterministic migration checksums, duplicate filing protection, and guarded CI for template copies.
+- 2026-10-22 — Added portable Ship token setup and status, repository validation, safe PR recovery, and Windows checks.
+- 2026-10-21 — Let `fnsh ship` create PRs with a securely supplied token or authenticated gh, and stop before push when a matching open PR exists.
 - 2026-10-19 — Distinguished an unpublished release from a GitHub connection failure in `fnsh upgrade check`, and restored direct execution for `upgrade` and `guard`.
 - 2026-10-19 — Generalized the shipped preferences and parameters into public starter defaults and linked the plan, ticket, and commit templates to them.
 - 2026-10-19 — Presented the included preferences and parameters as usable public starter defaults that each user can keep, edit, or remove.

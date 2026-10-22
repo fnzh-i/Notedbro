@@ -17,12 +17,12 @@ concurrency:
 jobs:
   validate:
     if: github.repository == 'fnzh-i/Notedbro'
-    name: validate (${{ matrix.python-version }})
+    name: validate (${{ matrix.os }}, Python ${{ matrix.python-version }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-latest, macos-latest, windows-latest]
         python-version:
           - "3.9"
           - "3.15"
@@ -50,20 +50,23 @@ jobs:
         if: runner.os == 'macOS'
         run: brew install age zstd
 
-      - name: Check onboarding and migration
+      - name: Check migration and runtime manifest
         run: |
-          python _Scripts/check-onboarding
-          python _Scripts/check-docs
           python _Scripts/check-migration verify-baseline
+          python _Scripts/build-runtime-manifest --check
+          python _Scripts/check-vault
+
+      - name: Check Ship credentials and recovery
+        run: python _Scripts/ship self-check
 
       - name: Run repository validators
         run: |
           python _Scripts/check-collaboration
           python _Scripts/check-file-session
           python _Scripts/check-provenance-tags
-          python _Scripts/check-vault
 
       - name: Run script self-checks
+        if: runner.os != 'Windows'
         run: |
           _Scripts/guard self-check
           _Scripts/upgrade self-check
@@ -71,3 +74,8 @@ jobs:
           python _Scripts/sync self-check
           python _Scripts/rebuild self-check
           python _Scripts/shadow self-check
+
+      - name: Check Windows token ACLs and local Ship flow
+        if: runner.os == 'Windows'
+        run: |
+          python _Scripts/publish self-check

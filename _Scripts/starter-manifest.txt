@@ -1,6 +1,7 @@
 # Paths that belong to the starter kit. A directory line ends with /.
 # Hub notes are listed one file at a time. Other files under Personal/ are not here.
 .github/
+.gitattributes
 Hosts/
 _Scripts/
 _Templates/
@@ -28,13 +29,6 @@ publish-denylist.example
 .gitignore
 Index.md
 Workspace map.example.md
-Workspace map.advanced.example.md
-Advanced configuration.md
-Maintainer guide.md
-Troubleshooting.md
-Migration 1.1.0.md
-Release 1.1.0.md
-Change report 1.1.0.md
 _Config/bootstrap.md
 Work/Example/Example.md
 Collaboration/Collaboration.md

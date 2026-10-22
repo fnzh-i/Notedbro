@@ -168,9 +168,8 @@ def main():
     canvas, decisions, sessions = build(groups)
     path = os.path.join(VAULT, CANVAS)
     text = json.dumps(canvas, indent=2, ensure_ascii=False) + "\n"
-    if not os.path.isfile(path) or read_text(path) != text:
-        with open(path, "w", encoding="utf-8") as handle:
-            handle.write(text)
+    with open(path, "w", encoding="utf-8") as handle:
+        handle.write(text)
     print(f"build-views: {decisions} decisions, {sessions} sessions, {len(groups)} groups")
     return 0
 

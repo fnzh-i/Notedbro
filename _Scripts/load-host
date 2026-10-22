@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Restore supported host configuration and list matching session cards.
+"""Restore missing personal files for one host, and list matching session cards.
 
-Claude settings are local to Brain. Cursor hooks use the selected home.
-Recognized generated wrappers can be repaired with backups. Snapshots stay private.
+Writes only on an allowlist under the home directory, and only when a file
+is missing. Snapshots live in _Scripts/host-restore/ and stay inside the vault.
 """
 import argparse
 import json
@@ -14,7 +14,6 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from vault_path import vault_root  # noqa: E402
-import onboarding  # noqa: E402
 
 VAULT = vault_root()
 HOSTS = ("claude-ai", "chatgpt", "gemini", "cursor", "claude", "codex")
@@ -134,7 +133,8 @@ def brain_block():
 
 
 def thin_hook(hook):
-    return onboarding.wrapper(VAULT, hook)
+    kind = "Stop" if hook == "cursor" else "Session-end"
+    return THIN_HOOK.format(kind=kind, hook=hook)
 
 
 def display(path, home):
@@ -427,16 +427,13 @@ def merge_json(path, mutate, home, restored, reported, left):
     if not isinstance(data, dict):
         reported.append(f"{label} broken")
         return True
-    before = json.dumps(data, sort_keys=True)
-    try:
-        mutate(data)
-    except ValueError as error:
-        reported.append(f"{label}: {error}")
-        return True
-    if before == json.dumps(data, sort_keys=True):
+    if commands_have_hook(data):
         left.append(label)
         return True
-    onboarding.write(VAULT, path, json.dumps(data, indent=2) + "\n", restored)
+    mutate(data)
+    ensure_parent(path, home)
+    path.write_text(json.dumps(data, indent=2) + "\n")
+    restored.append(label)
     return True
 
 
@@ -466,7 +463,8 @@ def restore_from_snapshot(path, snap, fallback, home, restored, reported, left):
 def add_claude_hook(data):
     hooks = data.setdefault("hooks", {})
     if not isinstance(hooks, dict):
-        raise ValueError("hooks must be an object")
+        data["hooks"] = {}
+        hooks = data["hooks"]
     session_end = hooks.setdefault("SessionEnd", [])
     if not isinstance(session_end, list):
         hooks["SessionEnd"] = []
@@ -477,17 +475,18 @@ def add_claude_hook(data):
 def add_cursor_hook(data):
     hooks = data.setdefault("hooks", {})
     if not isinstance(hooks, dict):
-        raise ValueError("hooks must be an object")
+        data["hooks"] = {}
+        hooks = data["hooks"]
     stop = hooks.setdefault("stop", [])
     end = hooks.setdefault("sessionEnd", [])
     if not isinstance(stop, list):
-        raise ValueError("stop must be a list")
+        hooks["stop"] = []
+        stop = hooks["stop"]
     if not isinstance(end, list):
-        raise ValueError("sessionEnd must be a list")
-    if not any(isinstance(item, dict) and item.get("command") == "python3 -I ./hooks/brain-reminder.py" for item in stop):
-        stop.append({"command": "python3 -I ./hooks/brain-reminder.py", "timeout": 45, "loop_limit": 1})
-    if not any(isinstance(item, dict) and item.get("command") == "python3 -I ./hooks/brain-reminder.py" for item in end):
-        end.append({"command": "python3 -I ./hooks/brain-reminder.py", "timeout": 45})
+        hooks["sessionEnd"] = []
+        end = hooks["sessionEnd"]
+    stop.append({"command": "python3 -I ./hooks/brain-reminder.py", "timeout": 45, "loop_limit": 1})
+    end.append({"command": "python3 -I ./hooks/brain-reminder.py", "timeout": 45})
 
 
 def append_brain_block(path, home, restored, reported, left):
@@ -579,13 +578,19 @@ def restore_host(host, home):
         return restored, reported, left, copied, paste_rule
     snap = snap_root(host)
     if host == "claude":
-        try:
-            onboarding.install_claude(VAULT, restored)
-            issues, protected = onboarding.legacy_hooks(VAULT, home)
-            reported.extend(issues)
-            reported.extend(protected)
-        except (ValueError, OSError) as error:
-            reported.append(str(error))
+        append_brain_block(home / ".claude" / "CLAUDE.md", home, restored, reported, left)
+        settings = home / ".claude" / "settings.json"
+        if not merge_json(settings, add_claude_hook, home, restored, reported, left):
+            restore_from_snapshot(settings, snap / "settings.json", None, home, restored, reported, left)
+        restore_from_snapshot(
+            home / ".claude" / "hooks" / "brain-reminder.py",
+            snap / "hooks" / "brain-reminder.py",
+            thin_hook("claude"),
+            home,
+            restored,
+            reported,
+            left,
+        )
     elif host == "cursor":
         hooks_json = home / ".cursor" / "hooks.json"
         if not merge_json(hooks_json, add_cursor_hook, home, restored, reported, left):
@@ -606,18 +611,6 @@ def restore_host(host, home):
             paste_rule = display(hook, home) in restored or file_state(hook) == "present" and before != "present"
         if any(item.endswith("hooks/brain-reminder.py") or item.endswith("brain-reminder.py") for item in restored):
             paste_rule = True
-        # Recognized generated v1.0.0 wrappers can be repaired; custom hooks remain untouched.
-        if hook.is_file() and not hook.is_symlink():
-            text = hook.read_text()
-            legacy = THIN_HOOK.format(kind="Stop", hook="cursor")
-            try:
-                recognized = onboarding.wrapper_shape(text) == onboarding.wrapper_shape(legacy) or onboarding.generated_wrapper(text, VAULT, "cursor")
-            except SyntaxError:
-                recognized = False
-            if recognized:
-                onboarding.write(VAULT, hook, thin_hook("cursor"), restored)
-            else:
-                reported.append(f"Custom Cursor wrapper preserved at {hook}; verify or migrate it manually before rerunning setup")
     restore_skills(host, home, restored, reported, left, copied)
     return restored, reported, left, copied, paste_rule
 

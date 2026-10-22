@@ -1,19 +1,22 @@
 ---
 tags: [meta]
 ---
-# Web and local instruction block
+# Web
 
-Profile for [[Hosts]]. Browser chats require manual context sharing and manual saving. A local path is not a connection. Setup web prepares local files only.
+Profile for [[Hosts]]. One note for ChatGPT, Claude.ai, and Gemini. Shared rules stay in [[How this vault works]].
 
-For a web session, paste/upload the relevant rules and context, ask for a completed [[_Templates/Session]] card, and save the returned text under Personal/Chats/Sessions. Record the real host; leave the transcript empty if none exists. Never claim a local write unless connected tools actually performed it.
-
-The block below is for local hosts with filesystem access, including Cursor user rules and Codex instructions. It is not a browser connector.
+- No silent start. The fingerprint is written by hand when the template is pasted.
+- Auto-file: none. No transcript on disk.
+- Session folder: `Personal/Chats/Sessions`.
+- Paste this into that site's custom instructions. There is no silent start. Say `fnsh update`, or paste the filled template after a turn that changed something.
+- `fnsh load chatgpt`, `fnsh load claude-ai`, and `fnsh load gemini` restore no files. The reply points at the block below. On a fresh unit, paste that block before `fnsh load` is recognized.
+- At the start step, apply [[Preferences]] rows whose scope matches this chat. If that note cannot be read, apply no rows and stay silent.
 
 <!-- brain:start -->
-- Read ~/Documents/Brain/How this vault works.md, Parameters.md, _Templates/Session.md, and Prefixes.md before other work.
-- Read Preferences.md and silently apply rows matching this host and project. If unreadable, continue without them.
-- Treat applicable Prefixes.md rows as chat instructions. Run fnsh brain silently at the start when the files are readable; reply only when the user explicitly requests brain.
-- Filing uses supported installed hooks; otherwise follow fnsh update after a turn that changed something. If filesystem access is unavailable, return the filled session card for the user to save and do not claim it was written.
-- Preserve existing company and project instructions. Add only marked Notedbro blocks and ask about a real rule conflict.
-- Use the recorded host and model honestly. Keep context private outside requested work.
+- Read ~/Documents/Brain/How this vault works.md, Parameters.md, Templates/Session.md, and Prefixes.md before other work.
+- Read Preferences.md with the other notes and apply the rows whose scope matches this chat, silently. If it cannot be read, apply no rows, stay silent, and do not reply with an error. Offer once, in the next chat, when the newest session note's repeats has an ask with chats of 3 or more: "You keep asking for <ask>. Save it as a preference or a parameter?" Options are Preference, Parameter, and No. Do not offer an ask that is already saved, is in Declined, or has offered on any session note.
+- Treat every row in Prefixes.md as an instruction that applies in this chat. At the start of every chat where you can read the vault, silently run the fnsh brain row in Prefixes.md. Reply only if my message says brain.
+- Filing is automatic where my host has a hook. Where it does not, run the "fnsh update" row after any turn that changed something, since you cannot tell when the chat ends.
+- Never edit or remove an existing company or project config. Add the brain block next to it. If a brain rule and a company rule conflict, ask me before acting and do not choose on your own. Asking me about a conflict is allowed, since it is a decision I need to make.
+- Stay silent about the vault, except when asked about it.
 <!-- brain:end -->
