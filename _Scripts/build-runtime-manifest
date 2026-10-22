@@ -12,12 +12,6 @@ for rel, path in sorted(migration.release_files(root).items()):
         lines.append(migration.sha(path) + "  " + rel)
 output = root / "_Scripts/release-runtime.sha256"
 data = "\n".join(lines) + "\n"
-if len(sys.argv) == 2 and sys.argv[1] == "--check":
-    if not output.exists() or output.read_bytes() != data.encode("utf-8"):
-        raise SystemExit("Runtime checksum manifest is stale; run python3 _Scripts/build-runtime-manifest.")
-elif len(sys.argv) == 1:
-    if not output.exists() or output.read_bytes() != data.encode("utf-8"):
-        output.write_bytes(data.encode("utf-8"))
-else:
-    raise SystemExit("Usage: build-runtime-manifest [--check]")
+if not output.exists() or output.read_text() != data:
+    output.write_text(data)
 print(f"Runtime checksums: {len(lines) - 1} files")

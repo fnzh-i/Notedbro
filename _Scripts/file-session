@@ -5,12 +5,16 @@ Reads host, model, conversation id, and transcript path. Writes only inside
 the vault. Does not edit config files and does not decide conflicts.
 """
 import datetime
+import contextlib
+import fcntl
 import hashlib
 import json
 import os
+from pathlib import Path
 import re
 import subprocess
 import sys
+import tempfile
 import urllib.error
 import urllib.request
 
@@ -92,8 +96,14 @@ def write_text(path, text):
     if not inside_vault(path):
         raise SystemExit("file-session: refused to write outside the vault")
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w") as fh:
-        fh.write(text)
+    fd, temporary = tempfile.mkstemp(prefix=".notedbro-", dir=os.path.dirname(path))
+    try:
+        with os.fdopen(fd, "w") as fh:
+            fh.write(text)
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
 
 
 def parameters_from_text(text):
@@ -178,6 +188,8 @@ def user_messages(events):
         if role not in ("user", "human"):
             continue
         raw = message_text(event)
+        if raw.lstrip().startswith(("# AGENTS.md instructions for ", "<environment_context>", "<external_codex_apps_open_page>", "<send_user_message_question_reply>")):
+            continue
         if "Brain vault reminder:" in raw and "<user_query>" not in raw:
             continue
         cleaned = clean_request(raw)
@@ -190,6 +202,7 @@ def user_messages(events):
 
 def load_events(path):
     events = []
+    codex_fallback = []
     with open(path, errors="ignore") as fh:
         for line in fh:
             line = line.strip()
@@ -200,7 +213,30 @@ def load_events(path):
             except ValueError:
                 continue
             if isinstance(event, dict):
-                events.append(event)
+                kind, payload = event.get("type"), event.get("payload", {})
+                if kind == "response_item" and isinstance(payload, dict):
+                    if payload.get("type") == "message":
+                        events.append(payload)
+                    elif payload.get("type") in ("function_call", "custom_tool_call"):
+                        name = payload.get("name", "")
+                        raw = payload.get("arguments", payload.get("input", ""))
+                        if "apply_patch" in name or "tools.apply_patch(" in str(raw):
+                            for rel in re.findall(r"\*\*\* (?:Add|Update|Delete) File: ([^\r\n\\]+)", str(raw)):
+                                events.append({"content": [{"type": "tool_use", "name": "Write", "input": {"path": rel.strip()}}]})
+                        elif name.rsplit(".", 1)[-1] in ("exec_command", "shell_command"):
+                            try:
+                                inp = json.loads(raw) if isinstance(raw, str) else raw
+                                events.append({"content": [{"type": "tool_use", "name": "Shell", "input": {"command": inp.get("cmd", inp.get("command", ""))}}]})
+                            except (ValueError, AttributeError):
+                                pass
+                elif kind == "event_msg" and isinstance(payload, dict) and payload.get("type") == "user_message":
+                    codex_fallback.append({"role": "user", "content": payload.get("message", "")})
+                elif kind == "turn_context" and isinstance(payload, dict):
+                    events.append(payload)
+                else:
+                    events.append(event)
+    if not any(event.get("role") == "user" or event.get("type") == "user" for event in events):
+        events.extend(codex_fallback)
     return events
 
 
@@ -826,7 +862,6 @@ def is_private(home):
 
 
 def find_note(conversation):
-    marker = f"conversation: {conversation}"
     for root, dirs, files in os.walk(VAULT):
         dirs[:] = [name for name in dirs if name not in (".git", "Skill files", "_Scripts", "_Templates", "_Config")]
         if os.path.basename(root) != "Sessions":
@@ -839,7 +874,7 @@ def find_note(conversation):
                 head = read_text(path)[:2000]
             except OSError:
                 continue
-            if marker in head:
+            if frontmatter_value(head, "conversation") == conversation:
                 return path
     return ""
 
@@ -851,7 +886,13 @@ def frontmatter_value(text, key):
     field = re.search(rf"(?m)^{re.escape(key)}:\s*(.+)$", match.group(1))
     if not field:
         return ""
-    return field.group(1).strip().strip('"')
+    value = field.group(1).strip()
+    if value.startswith('"'):
+        try:
+            return json.loads(value)
+        except json.JSONDecodeError:
+            return ""
+    return value
 
 
 def fallback_id(host, first_message):
@@ -1213,7 +1254,27 @@ def read_sources():
     return True
 
 
+@contextlib.contextmanager
+def filing_lock():
+    folder = Path(VAULT) / ".notedbro-local"
+    folder.mkdir(mode=0o700, exist_ok=True)
+    with (folder / "filing.lock").open("a") as handle:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle, fcntl.LOCK_UN)
+
+
 def file_session(args):
+    if not os.path.isdir(VAULT):
+        print("file-session: vault unreadable", file=sys.stderr)
+        return 1
+    with filing_lock():
+        return file_session_locked(args)
+
+
+def file_session_locked(args):
     if not os.path.isdir(VAULT) or not read_sources():
         print("file-session: vault unreadable", file=sys.stderr)
         return 1
@@ -1253,6 +1314,7 @@ def file_session(args):
     ):
         return 0
     conversation = args["conversation"] or fallback_id(host, messages[0] if messages else host)
+    receipt = Path(VAULT) / ".notedbro-local" / "filed" / hashlib.sha256(conversation.encode()).hexdigest()
     existing = find_note(conversation)
     kept_conflicts = args["conflicts"]
     if existing:
@@ -1267,7 +1329,7 @@ def file_session(args):
             filed_turns = int(filed) if filed else 0
         except ValueError:
             filed_turns = 0
-        if not args["manual"] and turns - filed_turns < params["refile_min_new_turns"]:
+        if not args["manual"] and receipt.is_file() and turns - filed_turns < params["refile_min_new_turns"]:
             return 0
     today = datetime.date.today().isoformat()
     if host in WEB_HOSTS:
@@ -1334,12 +1396,15 @@ def file_session(args):
             number += 1
         title = os.path.splitext(os.path.basename(path))[0]
         note = render_note(fields, title, card["asked"], card["changed"])
+    if receipt.exists():
+        receipt.unlink()
     write_text(path, note)
     ensure_index(home, title)
     if changed:
         upsert_daily(home, today, title, conversation)
     refresh_snapshot(host)
     refresh_views()
+    write_text(str(receipt), conversation + "\n")
     return 0
 
 
