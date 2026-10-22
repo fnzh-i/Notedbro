@@ -116,7 +116,9 @@ def included(vault):
             continue
         if publish_scan.is_private_path(name):
             continue
-        if (vault / name).is_file():
+        if (vault / name).is_symlink():
+            missing.append(name + " (symlink refused)")
+        elif (vault / name).is_file():
             found.append(Path(name))
         else:
             missing.append(name)
@@ -127,7 +129,7 @@ def included(vault):
             continue
         for path in iter_files(root):
             rel = path.relative_to(vault)
-            if set(rel.parts) & EXCLUDE_PARTS or path.is_symlink() or publish_scan.is_private_path(rel.as_posix()):
+            if set(rel.parts) & EXCLUDE_PARTS or path.name.startswith("._") or path.is_symlink() or publish_scan.is_private_path(rel.as_posix()):
                 continue
             found.append(rel)
     return found, missing

@@ -163,6 +163,7 @@ def prefix_problems(vault):
 
 def check(vault=VAULT):
     problems = []
+    problems += publish_scan.vault_token_hits(vault)
     for name in REQUIRED:
         if not (vault / name).is_file():
             problems.append(f"missing file: {name}")

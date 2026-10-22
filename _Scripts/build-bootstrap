@@ -19,8 +19,8 @@ SOURCES = (
 
 
 def source_bytes(vault=VAULT):
-    """Raw bytes of the three sources, in order, with nothing added between them."""
-    return b"".join((vault / name).read_bytes() for name in SOURCES)
+    """Canonical LF bytes of the three text sources, with nothing between them."""
+    return b"".join((vault / name).read_bytes().replace(b"\r\n", b"\n") for name in SOURCES)
 
 
 def source_digest(vault=VAULT):
@@ -54,7 +54,7 @@ def render(vault=VAULT):
 def main():
     out = VAULT / "_Config" / "bootstrap.md"
     out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_text(render())
+    out.write_bytes(render().encode("utf-8"))
     print(f"Wrote {out.relative_to(VAULT)}")
 
 

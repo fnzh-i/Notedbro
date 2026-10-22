@@ -49,10 +49,10 @@ Leave this out unless you keep a private vault and a public copy.
 - maintainer: no
 
 ## Ship
-| Project | Rule | Folder | Base |
-|---|---|---|---|
-| Example kit | notedbro | ~/.local/share/brain/publish | main |
-| Example website | branch-pr | ~/Code/example-website | staging |
+| Project | Rule | Folder | Base | Repository |
+|---|---|---|---|---|
+| Example kit | notedbro | ~/.local/share/brain/publish | main | example/example-kit |
+| Example website | branch-pr | ~/Code/example-website | staging | example/example-website |
 
 `Base` defaults to `staging` when omitted. Use `main` only when the project explicitly targets `main`.
 
