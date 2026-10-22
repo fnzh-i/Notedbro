@@ -36,20 +36,24 @@ KNOWN_PRIVATE_TOP = {
 }
 PUBLIC_REPO = "https://github.com/fnzh-i/Notedbro"
 PUBLIC_API = "https://api.github.com/repos/fnzh-i/Notedbro"
+PUBLIC_SLUG = PUBLIC_REPO.split("github.com/", 1)[1]
 ALLOWED_URL = re.compile(
     "(?:" + re.escape(PUBLIC_REPO) + "|" + re.escape(PUBLIC_API) + ")"
-    + r"[A-Za-z0-9/._#?=&-]*"
+    + r"[A-Za-z0-9/._#?=&-]*|(?<![A-Za-z0-9/._-])"
+    + re.escape(PUBLIC_SLUG) + r"(?![A-Za-z0-9._-])"
 )
 
 
 def token_patterns():
     """Built at runtime so this file does not contain a live secret shape."""
     ghp = "gh" + "p_"
+    fine = "github" + "_pat_"
     sk = "s" + "k-"
     akia = "AK" + "IA"
     header = "-----BEGIN " + "PRIVATE KEY-----"
     return (
-        (re.compile(re.escape(ghp) + r"[A-Za-z0-9]{8,}"), "token", ghp),
+        (re.compile(re.escape(fine) + r"[A-Za-z0-9_]{8,}"), "GitHub token", "none"),
+        (re.compile(re.escape(ghp) + r"[A-Za-z0-9]{8,}"), "GitHub token", "none"),
         (re.compile(re.escape(sk) + r"[A-Za-z0-9]{8,}"), "token", sk),
         (re.compile(re.escape(akia) + r"[A-Z0-9]{8,}"), "token", akia),
         (re.compile(re.escape(header)), "private key", "key"),
@@ -57,6 +61,8 @@ def token_patterns():
 
 
 def mask(value, prefix):
+    if prefix == "none":
+        return "****"
     if prefix == "key":
         return "-----BEGIN ****"
     shown = value[: len(prefix)]
@@ -75,7 +81,7 @@ def read_terms(path):
     if not path.is_file():
         return []
     terms = []
-    for line in path.read_text(errors="replace").splitlines():
+    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
         line = line.strip()
         if line and not line.startswith("#"):
             terms.append(line)
@@ -123,12 +129,12 @@ def map_terms(vault):
 def iter_files(root):
     root = Path(root)
     for dirpath, dirnames, filenames in os.walk(root):
-        dirnames[:] = sorted(name for name in dirnames if name != ".git")
+        dirnames[:] = sorted(name for name in dirnames if name not in {".git", "__pycache__"})
         for name in sorted(filenames):
             yield Path(dirpath) / name
 
 
-def _line_hits(text, terms, home, login, product_name, allow_product):
+def _line_hits(text, terms, home, login, product_name, allow_product, rel=""):
     patterns = []
     seen = set()
     for term in terms:
@@ -144,7 +150,13 @@ def _line_hits(text, terms, home, login, product_name, allow_product):
             kinds.append("phone")
         if home and home in line:
             kinds.append("home folder")
-        if login.search(line):
+        # GitHub Actions exposes its OS through the exact expression
+        # `runner.os`.  A runner login must still be found everywhere else,
+        # including other text in this workflow.
+        login_line = line
+        if login.pattern.endswith("runner(?![A-Za-z0-9_-])") and rel == ".github/workflows/ci.yml":
+            login_line = re.sub(r"(?<![A-Za-z0-9_-])runner\.os(?![A-Za-z0-9_-])", "", line)
+        if login.search(login_line):
             kinds.append("login name")
         if product_name and not allow_product and re.search(
             r"(?<![A-Za-z0-9_])" + re.escape(product_name) + r"(?![A-Za-z0-9_])", line
@@ -171,6 +183,8 @@ def scan(root, terms, product="", allow_product_paths=(), allowed_url=None):
     allowed = set(allow_product_paths)
     hits = []
     for path in iter_files(root):
+        if path.is_symlink():
+            continue
         rel = path.relative_to(root).as_posix()
         if path.suffix.lower() in IMAGE_SUFFIXES:
             continue
@@ -183,7 +197,7 @@ def scan(root, terms, product="", allow_product_paths=(), allowed_url=None):
             allowed_url = ALLOWED_URL
         text = allowed_url.sub("", text)
         allow = rel in allowed or rel.startswith("assets/") or rel.startswith("_Scripts/")
-        for number, kind in _line_hits(text, terms, home, login, product, allow):
+        for number, kind in _line_hits(text, terms, home, login, product, allow, rel):
             hits.append(f"{rel}:{number}: {kind}")
     return hits
 
@@ -204,6 +218,39 @@ def scan_text_hits(text, terms):
     return [term for term in terms if term_pattern(term).search(text)]
 
 
+def vault_token_hits(root):
+    """Find GitHub token shapes in local files without printing any token bytes."""
+    root = Path(root)
+    patterns = [pattern for pattern, label, _prefix in token_patterns() if label == "GitHub token"]
+    hits = []
+    try:
+        import ship_token
+        managed = ship_token.token_path()
+    except RuntimeError:
+        managed = None
+    for path in iter_files(root):
+        if path.is_symlink() or path.suffix.lower() in IMAGE_SUFFIXES:
+            continue
+        rel = path.relative_to(root).as_posix()
+        if managed and managed.exists():
+            try:
+                if os.path.samefile(path, managed):
+                    hits.append(f"{rel}: managed Ship token file alias")
+                    continue
+            except OSError:
+                continue
+        try:
+            data = path.read_bytes()
+        except OSError:
+            continue
+        if b"\0" in data:
+            continue
+        for line_number, line in enumerate(data.decode("utf-8", errors="replace").splitlines(), 1):
+            if any(pattern.search(line) for pattern in patterns):
+                hits.append(f"{rel}:{line_number}: GitHub token")
+    return hits
+
+
 def manifest_path(vault):
     return Path(vault) / "_Scripts" / "starter-manifest.txt"
 
@@ -213,7 +260,7 @@ def read_manifest(vault):
     files, dirs = [], []
     if not path.is_file():
         return files, dirs
-    for line in path.read_text(errors="replace").splitlines():
+    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
         line = line.strip()
         if not line or line.startswith("#"):
             continue

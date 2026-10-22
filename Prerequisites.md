@@ -3,7 +3,7 @@
 For automated local setup:
 
 - Git: verify in Terminal with `git --version`.
-- Python 3.9 or later: verify with `python3 --version`.
+- Python 3.9 or later: verify with `python3 --version`. On Windows, use `py _Scripts/<script>` (or `python _Scripts/<script>`); on macOS/Linux, use `python3 _Scripts/<script>`.
 - One installed local tool: Claude Code, Cursor, or Codex.
 - A GitHub account to create the recommended private template copy.
 

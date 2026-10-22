@@ -31,6 +31,7 @@
 !/Terms.md
 !/Hosts.md
 !/publish-denylist.example
+!/.gitattributes
 !/.gitignore
 !/Index.md
 !/Workspace map.example.md

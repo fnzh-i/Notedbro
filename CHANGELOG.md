@@ -2,6 +2,8 @@
 
 One dated line per pull request, newest first. Written in the pull request; sync never writes it.
 
+- 2026-10-22 — Added cross-platform Ship token setup, repository validation, safe PR recovery, and Windows checks.
+
 - 2026-10-22 — Made GitHub CLI optional for Ship with secure token-backed PR calls, pre-push duplicate checks, and explicit base and report safeguards.
 
 - 2026-10-20 — Added 1.1.0 private-template onboarding, local Claude hooks, deterministic migration checksums, duplicate filing protection, and guarded CI for template copies.

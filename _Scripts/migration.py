@@ -12,7 +12,7 @@ EXECUTABLES = {"setup", "check-migration", "check-onboarding", "check-docs", "gu
 
 def read_manifest(path):
     hashes = {}
-    for line in Path(path).read_text().splitlines():
+    for line in Path(path).read_text(encoding="utf-8").splitlines():
         if not line or line.startswith("#"):
             continue
         checksum, rel = line.split("  ", 1)
@@ -24,7 +24,15 @@ def read_manifest(path):
 
 
 def sha(path):
-    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+    """Hash release text consistently across LF and CRLF checkouts."""
+    path = Path(path)
+    data = path.read_bytes()
+    if (path.suffix.lower() in {".md", ".txt", ".py", ".yml", ".yaml", ".sha256"}
+            or path.name in {".gitignore", ".gitattributes"}
+            or (path.parent.name == "_Scripts" and not path.suffix
+                and (data.startswith(b"#!") or path.name == "notedbro-version"))) and b"\0" not in data:
+        data = data.replace(b"\r\n", b"\n")
+    return hashlib.sha256(data).hexdigest()
 
 
 def safe(root, rel):
@@ -40,7 +48,8 @@ def release_files(source=SOURCE):
     result = {}
     for path in Path(source).rglob("*"):
         rel = path.relative_to(source).as_posix()
-        if ".git" in path.parts or "__pycache__" in path.parts or is_private_path(rel):
+        if (".git" in path.parts or "__pycache__" in path.parts
+                or ".DS_Store" in path.parts or path.name.startswith("._") or is_private_path(rel)):
             continue
         if path.is_file() and not path.is_symlink() and in_manifest(rel, files, dirs):
             result[rel] = path
