@@ -46,7 +46,7 @@ def render(vault=VAULT):
     for name in SOURCES:
         lines.append(f"## Source: {name}")
         lines.append("")
-        lines.append((vault / name).read_text().rstrip("\n"))
+        lines.append((vault / name).read_text(encoding="utf-8").rstrip("\n"))
         lines.append("")
     return "\n".join(lines).rstrip() + "\n"
 

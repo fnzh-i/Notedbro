@@ -16,6 +16,7 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import publish_scan  # noqa: E402
@@ -72,6 +73,20 @@ HUBS = (
     ("Research", "Research"),
 )
 AREAS = ("Personal", "Work", "Collaboration", "Hackathons", "Research", "Plans")
+# These files belong to the public starter.  Publish reads them from the
+# locally fetched public main tree; the private source owns the shared rules
+# and implementation it overlays afterwards.
+PUBLIC_OWNED = (
+    ".github/ISSUE_TEMPLATE/config.yml", ".github/ISSUE_TEMPLATE/report.yml",
+    ".github/PULL_REQUEST_TEMPLATE.md", ".github/workflows/ci.yml", ".gitignore",
+    "Advanced configuration.md", "Change report 1.1.0.md", "Maintainer guide.md",
+    "Migration 1.1.0.md", "Release 1.1.0.md", "Troubleshooting.md",
+    "Workspace map.advanced.example.md", "Workspace map.example.md",
+    "README.md", "How to set up.md", "CONTRIBUTING.md", "SECURITY.md", "CHANGELOG.md",
+    "Hosts.md", "Hosts/Claude.md", "Hosts/Cursor.md", "Hosts/Web.md",
+    "_Scripts/check-docs", "_Scripts/check-onboarding", "_Scripts/onboarding.py",
+    "_Scripts/setup", "_Scripts/starter-manifest.txt", "assets/branding/notedbro.png",
+)
 
 EMAIL = re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b")
 PHONE = re.compile(r"(?<![\w.-])(?:\+?\d{1,3}[ .-])?\(?\d{3}\)?[ .-]\d{3}[ .-]\d{4}(?![\w.-])")
@@ -209,10 +224,52 @@ def write(path, text):
     path.write_text(text)
 
 
-def build_tree(vault, dest):
+def public_main(out):
+    """Return the local public main tree, never fetching or contacting a network."""
+    def git_out(*args):
+        return subprocess.run(["git", "-C", str(out), *args], capture_output=True, text=True)
+    if not (out / ".git").exists():
+        raise RuntimeError("Public-owned source is missing; refresh the local public checkout first.")
+    origin = git_out("rev-parse", "--verify", "refs/remotes/origin/main^{commit}")
+    local = git_out("rev-parse", "--verify", "refs/heads/main^{commit}")
+    if origin.returncode or local.returncode or origin.stdout.strip() != local.stdout.strip():
+        raise RuntimeError("Public-owned source is stale; refresh local origin/main and fast-forward main before publishing.")
+    return origin.stdout.strip()
+
+
+def copy_public_owned(out, dest):
+    commit = public_main(out)
+    for rel in PUBLIC_OWNED:
+        entry = subprocess.run(["git", "-C", str(out), "ls-tree", commit, "--", rel], capture_output=True, text=True)
+        fields = entry.stdout.rstrip("\n").split("\t", 1)
+        if entry.returncode or len(fields) != 2 or not fields[0].startswith("100"):
+            raise RuntimeError(f"Public-owned file is missing or a link: {rel}. Refresh the local public checkout.")
+        blob = subprocess.run(["git", "-C", str(out), "show", f"{commit}:{rel}"], capture_output=True)
+        if blob.returncode:
+            raise RuntimeError(f"Could not read public-owned file: {rel}.")
+        target = dest / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(blob.stdout)
+        if fields[0].startswith("100755"):
+            target.chmod(0o755)
+
+
+def unexpected_deletions(out, dest):
+    commit = public_main(out)
+    tracked = subprocess.run(["git", "-C", str(out), "ls-tree", "-r", "--name-only", commit], capture_output=True, text=True)
+    if tracked.returncode:
+        return ["could not list local public main"]
+    return [rel for rel in tracked.stdout.splitlines() if not (dest / rel).is_file()]
+
+
+def build_tree(vault, dest, out=None):
     """Copy the include list and write the generated files. Returns missing entries."""
     files, missing = included(vault)
+    if out is not None:
+        copy_public_owned(out, dest)
     for rel in files:
+        if out is not None and rel.as_posix() in PUBLIC_OWNED:
+            continue
         target = dest / rel
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(vault / rel, target)
@@ -223,13 +280,16 @@ def build_tree(vault, dest):
     write(dest / "Personal" / "Chats" / "Chats.md", chats_text())
     write(dest / "Index.md", index_text())
     example = dest / "_Templates" / "Workspace map.md"
-    if example.is_file():
+    if example.is_file() and (out is None or "Workspace map.example.md" not in PUBLIC_OWNED):
         write(dest / "Workspace map.example.md", example.read_text())
-    else:
+    elif not example.is_file():
         missing.append("_Templates/Workspace map.md")
-    write(dest / ".gitignore", gitignore_text(vault))
+    if out is None or ".gitignore" not in PUBLIC_OWNED:
+        write(dest / ".gitignore", gitignore_text(vault))
     bootstrap = load_script("build-bootstrap")
     write(dest / "_Config" / "bootstrap.md", bootstrap.render(dest))
+    if out is not None:
+        missing += [name + " (would be deleted from public main)" for name in unexpected_deletions(out, dest)]
     return missing
 
 
@@ -304,7 +364,10 @@ def publish(vault=VAULT, out=OUT, denylist=DENYLIST):
     staging = Path(tempfile.mkdtemp(prefix=f".{out.name}-", dir=out.parent))
     assert_outside(staging, vault, "publish folder")
     try:
-        missing = build_tree(vault, staging)
+        try:
+            missing = build_tree(vault, staging, out)
+        except RuntimeError as error:
+            return str(error) + "\nPublish withheld.", False
         problems = [f"{name}: missing from the vault" for name in missing]
         scanned = scan(staging, read_terms(denylist) + map_terms(vault))
         problems += scanned
@@ -364,6 +427,20 @@ def _self_check():
             "| Project | Rule | Folder |\n|---|---|---|\n"
             f"| Example kit | notedbro | {out} |\n"
         ))
+        if not shutil.which("git"):
+            raise SystemExit("self-check: git is required for public-owned preservation")
+        subprocess.run(["git", "init", "-q", str(out)], check=True)
+        test_email = "tests" + "@" + "example.invalid"
+        subprocess.run(["git", "-C", str(out), "config", "user.email", test_email], check=True)
+        subprocess.run(["git", "-C", str(out), "config", "user.name", "Publish tests"], check=True)
+        for rel in PUBLIC_OWNED:
+            target = out / rel
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source / rel, target)
+        subprocess.run(["git", "-C", str(out), "add", "."], check=True)
+        subprocess.run(["git", "-C", str(out), "commit", "-qm", "public source"], check=True)
+        subprocess.run(["git", "-C", str(out), "branch", "-M", "main"], check=True)
+        subprocess.run(["git", "-C", str(out), "update-ref", "refs/remotes/origin/main", "HEAD"], check=True)
 
         reply, ok = publish(vault, out, denylist)
         if not ok or reply != f"Published: {shown(out)}":
@@ -387,7 +464,6 @@ def _self_check():
                 raise SystemExit(f"self-check: {rel} was not copied intact")
 
         if shutil.which("git"):
-            subprocess.run(["git", "init", "-q", str(out)], check=True)
             for rel in ("Personal/Diary.md", "Work/Acme/Acme.md", "Work/Example/my-note.md", "School/note.md",
                         "Research/Topic/Topic.md", "Workspace map.md",
                         "Plans/plan.md", "Skill files/x.md", "_Scripts/host-restore/x", "a.canvas", "shadow.key"):
@@ -405,8 +481,8 @@ def _self_check():
             ("Prefixes.md", planted_email, "email ("),
             ("Terms.md", planted_project.lower(), f"denylist ({planted_project})"),
             ("Parameters.md", "see " + "ZQ" + "-12", "denylist (" + "ZQ" + "-)"),
-            ("Hosts.md", "the " + PRODUCT + " kit", f"{PRODUCT} outside the title"),
-            ("Hosts.md", str(Path.home()) + "/x", "home folder"),
+            ("Terms.md", "the " + PRODUCT + " kit", f"{PRODUCT} outside the title"),
+            ("Terms.md", str(Path.home()) + "/x", "home folder"),
         ):
             original = (vault / rel).read_text()
             (vault / rel).write_text(original + text + "\n")
@@ -422,6 +498,17 @@ def _self_check():
                 raise SystemExit(f"self-check: {word!r} matched a term inside a word")
         if not scan_text_hits("fnsh " + "ci" + "si params", ["ci" + "si"]):
             raise SystemExit("self-check: a standalone term was missed")
+
+        scanner_root = root / "scanner"
+        workflow = scanner_root / ".github" / "workflows" / "ci.yml"
+        write(workflow, "if: runner.os == 'Windows'\n")
+        with patch.object(publish_scan.getpass, "getuser", return_value="runner"):
+            if publish_scan.scan(scanner_root, []):
+                raise SystemExit("self-check: runner.os was treated as a login name")
+        write(workflow, "owner: runner\n")
+        with patch.object(publish_scan.getpass, "getuser", return_value="runner"):
+            if not any("login name" in hit for hit in publish_scan.scan(scanner_root, [])):
+                raise SystemExit("self-check: a workflow login name was not detected")
 
         noise = vault / "assets" / "branding" / "noise.png"
         noise.parent.mkdir(parents=True, exist_ok=True)

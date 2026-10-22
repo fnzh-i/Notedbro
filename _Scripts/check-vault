@@ -112,7 +112,7 @@ def host_file_state(vault, rel):
     path = vault / rel
     if not path.is_file():
         return "missing"
-    text = path.read_text(errors="replace")
+    text = path.read_text(encoding="utf-8", errors="replace")
     if not text.strip():
         return "damaged"
     if rel == "CLAUDE.md":
@@ -140,7 +140,7 @@ def action_words(vault):
     path = vault / "_Scripts" / "file-session"
     if not path.is_file():
         return set()
-    match = ACTION_WORDS.search(path.read_text(errors="replace"))
+    match = ACTION_WORDS.search(path.read_text(encoding="utf-8", errors="replace"))
     return set(ast.literal_eval(match.group(1))) if match else set()
 
 
@@ -148,7 +148,7 @@ def prefix_problems(vault):
     path = vault / "Prefixes.md"
     if not path.is_file():
         return []
-    text = path.read_text(errors="replace")
+    text = path.read_text(encoding="utf-8", errors="replace")
     problems = []
     for word in sorted(action_words(vault)):
         if not re.search(rf"(?m)^\| fnsh {re.escape(word)}\b", text):
@@ -178,7 +178,7 @@ def check(vault=VAULT):
         except OSError as error:
             problems.append(f"_Config/bootstrap.md: cannot hash sources ({error})")
             digest = ""
-        match = HASH_LINE.search(bootstrap.read_text())
+        match = HASH_LINE.search(bootstrap.read_text(encoding="utf-8"))
         if not match:
             problems.append("_Config/bootstrap.md: missing sources-sha256")
         elif digest and match.group(1) != digest:
@@ -194,7 +194,7 @@ def check(vault=VAULT):
             rel = path.relative_to(vault)
             if rel.as_posix() in REPO_DOCS:
                 continue
-            text = path.read_text(errors="replace")
+            text = path.read_text(encoding="utf-8", errors="replace")
             front = FRONTMATTER.match(text)
             if not front or not TAGS_KEY.search(front.group(1)):
                 problems.append(f"{rel.as_posix()}: missing tags")
@@ -232,7 +232,7 @@ def check(vault=VAULT):
 
 def notedbro_version():
     path = Path(__file__).with_name("notedbro-version")
-    return path.read_text(errors="replace").strip() if path.is_file() else "0"
+    return path.read_text(encoding="utf-8", errors="replace").strip() if path.is_file() else "0"
 
 
 def manifest_warnings(vault):

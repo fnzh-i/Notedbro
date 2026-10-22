@@ -12,7 +12,7 @@ EXECUTABLES = {"setup", "check-migration", "check-onboarding", "check-docs", "gu
 
 def read_manifest(path):
     hashes = {}
-    for line in Path(path).read_text().splitlines():
+    for line in Path(path).read_text(encoding="utf-8").splitlines():
         if not line or line.startswith("#"):
             continue
         checksum, rel = line.split("  ", 1)

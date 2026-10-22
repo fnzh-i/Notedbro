@@ -81,7 +81,7 @@ def read_terms(path):
     if not path.is_file():
         return []
     terms = []
-    for line in path.read_text(errors="replace").splitlines():
+    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
         line = line.strip()
         if line and not line.startswith("#"):
             terms.append(line)
@@ -134,7 +134,7 @@ def iter_files(root):
             yield Path(dirpath) / name
 
 
-def _line_hits(text, terms, home, login, product_name, allow_product):
+def _line_hits(text, terms, home, login, product_name, allow_product, rel=""):
     patterns = []
     seen = set()
     for term in terms:
@@ -150,7 +150,13 @@ def _line_hits(text, terms, home, login, product_name, allow_product):
             kinds.append("phone")
         if home and home in line:
             kinds.append("home folder")
-        if login.search(line):
+        # GitHub Actions exposes its OS through the exact expression
+        # `runner.os`.  A runner login must still be found everywhere else,
+        # including other text in this workflow.
+        login_line = line
+        if login.pattern.endswith("runner(?![A-Za-z0-9_-])") and rel == ".github/workflows/ci.yml":
+            login_line = re.sub(r"(?<![A-Za-z0-9_-])runner\.os(?![A-Za-z0-9_-])", "", line)
+        if login.search(login_line):
             kinds.append("login name")
         if product_name and not allow_product and re.search(
             r"(?<![A-Za-z0-9_])" + re.escape(product_name) + r"(?![A-Za-z0-9_])", line
@@ -191,7 +197,7 @@ def scan(root, terms, product="", allow_product_paths=(), allowed_url=None):
             allowed_url = ALLOWED_URL
         text = allowed_url.sub("", text)
         allow = rel in allowed or rel.startswith("assets/") or rel.startswith("_Scripts/")
-        for number, kind in _line_hits(text, terms, home, login, product, allow):
+        for number, kind in _line_hits(text, terms, home, login, product, allow, rel):
             hits.append(f"{rel}:{number}: {kind}")
     return hits
 
@@ -254,7 +260,7 @@ def read_manifest(vault):
     files, dirs = [], []
     if not path.is_file():
         return files, dirs
-    for line in path.read_text(errors="replace").splitlines():
+    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
         line = line.strip()
         if not line or line.startswith("#"):
             continue

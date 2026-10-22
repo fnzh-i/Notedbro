@@ -143,7 +143,7 @@ def _win_check(path, directory=False, repair=False):
 
 
 def _win_secure(path, directory=False):
-    """Set a private owner/SYSTEM/Administrators DACL without a child process."""
+    """Set the current user as owner and sole effective ACL entry in-process."""
     from ctypes import wintypes
 
     adv = ctypes.WinDLL("advapi32", use_last_error=True)
@@ -168,7 +168,10 @@ def _win_secure(path, directory=False):
         sid = _sid_string(ctypes.c_void_p.from_buffer(buf).value, adv)
     finally:
         kernel.CloseHandle(token)
-    sddl = "D:P(A;" + ("OICI" if directory else "") + ";FA;;;" + sid + ")"
+    # Set owner and DACL together.  A newly created directory can inherit an
+    # unexpected owner from a CI temporary directory, so DACL-only repair is
+    # insufficient before token bytes are written.
+    sddl = "O:" + sid + "D:P(A;" + ("OICI" if directory else "") + ";FA;;;" + sid + ")"
     descriptor = ctypes.c_void_p()
     adv.ConvertStringSecurityDescriptorToSecurityDescriptorW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, ctypes.POINTER(ctypes.c_void_p), ctypes.c_void_p]
     adv.ConvertStringSecurityDescriptorToSecurityDescriptorW.restype = wintypes.BOOL
@@ -177,7 +180,7 @@ def _win_secure(path, directory=False):
     try:
         adv.SetFileSecurityW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, ctypes.c_void_p]
         adv.SetFileSecurityW.restype = wintypes.BOOL
-        if not adv.SetFileSecurityW(str(path), 0x4, descriptor):
+        if not adv.SetFileSecurityW(str(path), 0x5, descriptor):
             raise RuntimeError("cannot secure the Windows Ship token file.")
     finally:
         kernel.LocalFree(descriptor)
