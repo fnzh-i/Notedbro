@@ -102,7 +102,7 @@ def maintainer_ready(vault, denylist):
     found = workspace_map.load_map(vault)
     if not found.get("maintainer"):
         return False
-    return any(rule == "notedbro" and folder for _project, rule, folder in found.get("ships", []))
+    return any(rule == "notedbro" and folder for _project, rule, folder, *_base in found.get("ships", []))
 
 
 def map_terms(vault):

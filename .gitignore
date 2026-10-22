@@ -71,4 +71,5 @@
 shadow.key
 __pycache__/
 # >>> brain-guard
+report.md
 # <<< brain-guard

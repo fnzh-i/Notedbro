@@ -1,13 +1,18 @@
 #!/usr/bin/env python3
-"""Ship a project by its Workspace map rule. Never pushes main. Never resets hard."""
+"""Ship a project through a configured base branch and reviewed pull request."""
 
 import hashlib
+import io
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -17,7 +22,25 @@ from vault_path import vault_root  # noqa: E402
 
 PREVIEW_SECONDS = 30 * 60
 TYPES = ("feat", "fix", "chore", "refactor", "docs", "test")
+ALLOWED_BASES = {"main", "staging"}
 LOCAL_LINE = "Checked locally. Nothing was sent anywhere."
+API_ROOT = "https://api.github.com"
+SECRET_ENV = ("NOTEDBRO_SHIP_TOKEN", "GITHUB_TOKEN", "GH_TOKEN")
+
+
+def child_env():
+    """Do not expose any Ship or CI token to git, gh, or store helpers."""
+    return {key: value for key, value in os.environ.items() if key not in SECRET_ENV}
+
+
+def safe_error(message):
+    """Avoid echoing credentials from Git or HTTP error text."""
+    for key in SECRET_ENV:
+        secret = os.environ.get(key)
+        if secret:
+            message = message.replace(secret, "[redacted]")
+    message = re.sub(r"(?i)(https?://)[^/@\s]+@", r"\1[redacted]@", message)
+    return message
 
 
 def preview_path():
@@ -33,9 +56,9 @@ def denylist_path():
 
 
 def git(repo, *args, check=True):
-    result = subprocess.run(["git", "-C", str(repo), *args], capture_output=True, text=True)
+    result = subprocess.run(["git", "-C", str(repo), *args], capture_output=True, text=True, env=child_env())
     if check and result.returncode != 0:
-        raise RuntimeError(result.stderr.strip() or "git " + " ".join(args))
+        raise RuntimeError(safe_error(result.stderr.strip()) or "git " + " ".join(args))
     return result
 
 
@@ -51,7 +74,7 @@ def branch_name(title):
 def diff_names(repo, base):
     diff = git(repo, "diff", "--name-only", base, check=False).stdout.splitlines()
     others = git(repo, "ls-files", "--others", "--exclude-standard", check=False).stdout.splitlines()
-    return sorted({line.strip() for line in diff + others if line.strip()})
+    return sorted({line.strip() for line in diff + others if line.strip() and line.strip() != "report.md"})
 
 
 def file_hash(repo, names):
@@ -69,9 +92,9 @@ def project_rule(vault, project):
     ships = found.get("ships", [])
     if project:
         key = project.lower()
-        for name, rule, folder in ships:
+        for name, rule, folder, base in ships:
             if name.lower() == key or workspace_map.expand(name).lower() == key:
-                return name, rule, folder, found
+                return name, rule, folder, base, found
         return None
     return None
 
@@ -122,9 +145,6 @@ def classify(vault, repo, names, project_folder):
     root = Path(project_folder).resolve() if project_folder else None
     repo_root = Path(repo).resolve()
     for rel in names:
-        if rel in {".claude/settings.local.json", ".claude/hooks/notedbro.py"} or rel.startswith(".notedbro-local/"):
-            private.append(rel)
-            continue
         if publish_scan.is_private_path(rel) and not publish_scan.in_manifest(rel, files, dirs):
             private.append(rel)
             continue
@@ -152,48 +172,281 @@ def classify(vault, repo, names, project_folder):
     return unknown, private, scans
 
 
-def pr_text(repo, title, names):
-    template = Path(repo) / ".github" / "PULL_REQUEST_TEMPLATE.md"
-    body = template.read_text(errors="replace") if template.is_file() else "## What changed\n\n## Checklist\n"
-    changed = "\n".join(f"- `{name}`" for name in names) or "- none"
-    text = f"# {title}\n\n{body}\n\n## Files\n{changed}\n"
-    return text
-
-
-def title_from(repo):
-    changelog = Path(repo) / "CHANGELOG.md"
-    if changelog.is_file():
-        for line in changelog.read_text(errors="replace").splitlines():
-            if line.startswith("- "):
-                return line[2:].split("—", 1)[-1].strip()[:80]
-    return "Update the starter kit"
-
-
-def public_repo(repo):
-    flag = os.environ.get("BRAIN_SHIP_PUBLIC")
-    if flag == "1":
-        return True
-    if flag == "0":
-        return False
-    if not shutil_which("gh"):
-        return True
-    result = subprocess.run(["gh", "repo", "view", "--json", "visibility"], cwd=str(repo), capture_output=True, text=True)
-    if result.returncode != 0:
-        return True
-    return "public" in result.stdout.lower()
+def report_from(repo):
+    path = Path(repo) / "report.md"
+    if not path.is_file():
+        return None, None, "report.md is missing."
+    text = path.read_text(errors="replace").strip()
+    frontmatter = re.match(r"\A---\r?\n.*?\r?\n---\r?\n", text, re.S)
+    if frontmatter:
+        text = text[frontmatter.end():].strip()
+    sections = {}
+    current = None
+    for line in text.splitlines():
+        heading = re.match(r"^##\s+(.+?)\s*$", line)
+        if heading:
+            current = re.sub(r"[^a-z]+", " ", heading.group(1).lower()).strip()
+            sections[current] = []
+        elif current:
+            sections[current].append(line)
+    required = ("change and reason", "files touched", "files not touched")
+    missing = [name for name in required if not " ".join(sections.get(name, [])).strip()]
+    if missing:
+        return None, None, "report.md is incomplete; add non-empty sections: " + ", ".join(missing) + "."
+    change = next(line.strip().lstrip("- *") for line in sections["change and reason"] if line.strip())
+    title = re.sub(r"\s+", " ", change).split(". ", 1)[0].rstrip(".")[:80]
+    if not title:
+        return None, None, "report.md has no usable summary under Change and reason."
+    lines = text.splitlines()
+    body = "\n".join(lines[1:]).strip() if lines and lines[0].startswith("# ") else text
+    if not body:
+        return None, None, "report.md has no body for the commit description and PR body."
+    return title, body + "\n", None
 
 
 def shutil_which(name):
-    from shutil import which
-    return which(name)
+    return shutil.which(name)
 
 
-def restore(repo, rule, start):
-    if rule == "notedbro":
-        git(repo, "checkout", "main")
-        git(repo, "pull", "--ff-only", check=False)
-        return
-    git(repo, "checkout", start)
+def github_repo(repo):
+    """Resolve origin, rejecting credential-bearing and non-GitHub remotes."""
+    raw = git(repo, "config", "--get-all", "remote.origin.url", check=False)
+    expanded = git(repo, "remote", "get-url", "--all", "origin", check=False)
+    push_raw = git(repo, "config", "--get-all", "remote.origin.pushurl", check=False)
+    push_expanded = git(repo, "remote", "get-url", "--push", "--all", "origin", check=False)
+    if raw.returncode or expanded.returncode or push_expanded.returncode:
+        raise RuntimeError("origin remote is missing.")
+    fetch_urls = expanded.stdout.splitlines()
+    push_urls = push_expanded.stdout.splitlines()
+    if len(fetch_urls) != 1 or len(push_urls) != 1:
+        raise RuntimeError("origin must have exactly one fetch URL and one push URL.")
+    urls = raw.stdout.splitlines() + fetch_urls + push_urls
+    if push_raw.returncode == 0:
+        urls += push_raw.stdout.splitlines()
+    for url in urls:
+        if any(secret and secret in url for secret in (os.environ.get(key) for key in SECRET_ENV)):
+            raise RuntimeError("origin remote contains a credential; remove it from Git configuration.")
+        if re.search(r"(?i)https?://[^/@\s]+@", url):
+            raise RuntimeError("origin remote contains a credential; remove it from Git configuration.")
+
+    def parse(url):
+        match = re.fullmatch(r"git@github\.com:([^/]+)/([^/]+?)(?:\.git)?", url)
+        if not match:
+            parsed = urllib.parse.urlsplit(url)
+            if parsed.hostname != "github.com" or parsed.scheme not in {"https", "ssh"}:
+                raise RuntimeError("origin must be a GitHub SSH or HTTPS remote.")
+            if parsed.username not in {None, "git"} or parsed.password:
+                raise RuntimeError("origin remote contains a credential; remove it from Git configuration.")
+            match = re.fullmatch(r"/([^/]+)/([^/]+?)(?:\.git)?/?", parsed.path)
+        if not match:
+            raise RuntimeError("origin must identify one GitHub owner and repository.")
+        return match.group(1), match.group(2)
+
+    source = parse(fetch_urls[0])
+    destination = parse(push_urls[0])
+    if tuple(part.lower() for part in source) != tuple(part.lower() for part in destination):
+        raise RuntimeError("origin fetch and push URLs target different GitHub repositories.")
+    return source
+
+
+def store_token():
+    if sys.platform == "darwin":
+        command = ["security", "find-generic-password", "-s", "notedbro-ship", "-a", "github", "-w"]
+    elif sys.platform.startswith("linux"):
+        command = ["secret-tool", "lookup", "service", "notedbro-ship", "account", "github"]
+    else:
+        return None
+    if not shutil_which(command[0]):
+        return None
+    try:
+        result = subprocess.run(command, capture_output=True, text=True, env=child_env(), timeout=45)
+    except subprocess.TimeoutExpired:
+        raise RuntimeError("OS credential store did not respond.") from None
+    if result.returncode == 0:
+        return result.stdout.strip() or None
+    if result.returncode in {1, 44}:
+        return None
+    raise RuntimeError("OS credential store could not be read.")
+
+
+def transport():
+    token = os.environ.get("NOTEDBRO_SHIP_TOKEN", "").strip()
+    if token:
+        return "token", token
+    token = store_token()
+    if token:
+        return "token", token
+    if shutil_which("gh") and os.environ.get("BRAIN_SHIP_GH") != "0":
+        return "gh", None
+    raise RuntimeError("provide NOTEDBRO_SHIP_TOKEN, a notedbro-ship OS credential, or authenticated gh.")
+
+
+def api_json(token, method, endpoint, params=None, payload=None):
+    url = API_ROOT + endpoint
+    if params:
+        url += "?" + urllib.parse.urlencode(params)
+    data = json.dumps(payload).encode() if payload is not None else None
+    request = urllib.request.Request(url, data=data, method=method, headers={
+        "Accept": "application/vnd.github+json",
+        "Authorization": "Bearer " + token,
+        "X-GitHub-Api-Version": "2022-11-28",
+        "User-Agent": "notedbro-ship",
+        **({"Content-Type": "application/json"} if data is not None else {}),
+    })
+    try:
+        with urllib.request.urlopen(request, timeout=15) as response:
+            return json.load(response)
+    except urllib.error.HTTPError as error:
+        if error.code == 401:
+            raise RuntimeError("GitHub token is invalid or expired.") from None
+        if error.code in {403, 404}:
+            raise RuntimeError("GitHub token cannot access this repository or PR operation.") from None
+        raise RuntimeError(f"GitHub API request failed (HTTP {error.code}).") from None
+    except (urllib.error.URLError, TimeoutError):
+        raise RuntimeError("could not reach the GitHub API.") from None
+    except Exception:
+        raise RuntimeError("GitHub API returned an invalid response.") from None
+
+
+def gh_json(repo, endpoint):
+    result = subprocess.run(["gh", "api", endpoint], cwd=str(repo), capture_output=True, text=True, env=child_env())
+    if result.returncode:
+        raise RuntimeError("gh authentication or repository access failed.")
+    try:
+        return json.loads(result.stdout)
+    except json.JSONDecodeError:
+        raise RuntimeError("gh returned an invalid GitHub API response.") from None
+
+
+def existing_pr(pulls, owner, branch, base):
+    for pull in pulls:
+        if not isinstance(pull, dict):
+            raise RuntimeError("GitHub returned an invalid pull-request list.")
+        head = pull.get("head") or {}
+        head_owner = ((head.get("repo") or {}).get("owner") or {}).get("login")
+        head_owner = head_owner or (head.get("label") or "").split(":", 1)[0]
+        if (head.get("ref") == branch and head_owner and head_owner.lower() == owner.lower()
+                and (pull.get("base") or {}).get("ref") == base and pull.get("state") == "open"):
+            return pull.get("html_url")
+    return None
+
+
+def preflight(repo, branch, base, title, body, names):
+    owner, name = github_repo(repo)
+    method, token = transport()
+    endpoint = f"/repos/{urllib.parse.quote(owner)}/{urllib.parse.quote(name)}"
+    query = {"state": "open", "head": owner + ":" + branch, "base": base}
+    selected = [value for value in (os.environ.get(key) for key in SECRET_ENV) if value]
+    if token and token not in selected:
+        selected.append(token)
+    for secret in selected:
+        needle = secret.encode()
+        if needle in (title + "\n" + body + "\n" + "\n".join(names)).encode() or any(
+            needle in (Path(repo) / path).read_bytes() for path in names if (Path(repo) / path).is_file()
+        ):
+            raise RuntimeError("a credential appears in content selected for Ship.")
+    if token:
+        user = api_json(token, "GET", "/user")
+        repository = api_json(token, "GET", endpoint)
+        pulls = api_json(token, "GET", endpoint + "/pulls", query)
+    else:
+        user = gh_json(repo, "/user")
+        repository = gh_json(repo, endpoint)
+        pulls = gh_json(repo, endpoint + "/pulls?" + urllib.parse.urlencode(query))
+    if not isinstance(user, dict):
+        raise RuntimeError("could not confirm the authenticated GitHub account.")
+    account = user.get("login")
+    if not account or not isinstance(repository, dict) or repository.get("full_name", "").lower() != f"{owner}/{name}".lower():
+        raise RuntimeError("could not confirm the authenticated account and target repository.")
+    if not isinstance(pulls, list):
+        raise RuntimeError("could not check existing pull requests.")
+    public = not repository.get("private", True)
+    flag = os.environ.get("BRAIN_SHIP_PUBLIC")
+    if flag in {"0", "1"}:
+        public = flag == "1"
+    return {"method": method, "account": account, "owner": owner, "name": name,
+            "public": public, "existing": existing_pr(pulls, owner, branch, base), "token": token}
+
+
+def create_pr(repo, auth, branch, base, title, body):
+    if auth["method"] == "token":
+        endpoint = f"/repos/{urllib.parse.quote(auth['owner'])}/{urllib.parse.quote(auth['name'])}/pulls"
+        created = api_json(auth["token"], "POST", endpoint,
+                           payload={"head": branch, "base": base, "title": title, "body": body})
+        url = created.get("html_url") if isinstance(created, dict) else None
+    else:
+        result = subprocess.run([
+            "gh", "pr", "create", "--repo", auth["owner"] + "/" + auth["name"],
+            "--base", base, "--head", branch, "--title", title, "--body-file", str(pr_path()),
+        ], cwd=str(repo), capture_output=True, text=True, env=child_env())
+        url = result.stdout.strip() if result.returncode == 0 else None
+    if not url or not url.startswith("https://github.com/"):
+        raise RuntimeError("branch was pushed, but pull request creation did not return a URL.")
+    return url
+
+
+def restore(repo, start):
+    if start and start != "HEAD":
+        git(repo, "switch", start)
+
+
+def resumable_branch(repo, payload, base_ref):
+    """Accept only the exact unpushed commit created by this preview."""
+    branch = payload["branch"]
+    current = git(repo, "symbolic-ref", "--quiet", "--short", "HEAD", check=False).stdout.strip()
+    if current != branch:
+        return False
+    upstream = git(repo, "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}", check=False)
+    if upstream.returncode == 0:
+        return False
+    remote = git(repo, "ls-remote", "--exit-code", "origin", "refs/heads/" + branch, check=False)
+    if remote.returncode != 2:
+        return False
+    parent = git(repo, "rev-parse", branch + "^", check=False).stdout.strip()
+    base_commit = git(repo, "rev-parse", base_ref, check=False).stdout.strip()
+    if not parent or parent != base_commit:
+        return False
+    commits = git(repo, "rev-list", "--count", base_ref + ".." + branch, check=False).stdout.strip()
+    if commits != "1":
+        return False
+    expected = payload["title"] + "\n\n" + payload["body"].rstrip()
+    message = git(repo, "show", "-s", "--format=%B", branch, check=False).stdout
+    return message.rstrip() == expected
+
+
+def fetch_base(repo, base):
+    if base not in ALLOWED_BASES:
+        return f"Ship withheld: unsupported base branch {base!r}. Use staging or main."
+    fetched = git(repo, "fetch", "origin", check=False)
+    if fetched.returncode:
+        return "Ship withheld: could not fetch origin: " + safe_error(fetched.stderr.strip() or "fetch failed")
+    target = "refs/remotes/origin/" + base + "^{commit}"
+    if git(repo, "rev-parse", "--verify", target, check=False).returncode:
+        return f"Ship withheld: origin/{base} does not exist after fetching. No fallback or base branch creation was attempted."
+    return None
+
+
+def push_destination_error(branch, upstream, remote_ref):
+    """Validate the configured upstream and the actual refs/heads target."""
+    if branch in {"main", "staging", "master"}:
+        return f"refusing to push protected branch {branch}"
+    expected = "refs/heads/" + branch
+    if remote_ref != expected:
+        return f"refusing push destination {remote_ref}; expected {expected}"
+    if upstream and upstream in {"origin/main", "origin/staging", "refs/remotes/origin/main", "refs/remotes/origin/staging"}:
+        return f"branch tracks protected upstream {upstream}"
+    if upstream and upstream not in {"origin/" + branch, "refs/remotes/origin/" + branch}:
+        return f"branch tracks unexpected upstream {upstream}"
+    return None
+
+
+def refspec_error(refspec):
+    if ":" not in refspec:
+        return None
+    destination = refspec.split(":", 1)[1].lstrip("+")
+    if destination in {"main", "staging", "refs/heads/main", "refs/heads/staging"}:
+        return "refusing refspec that targets protected branch " + destination
+    return None
 
 
 def write_preview(payload):
@@ -205,30 +458,35 @@ def write_preview(payload):
     pr.write_text(payload["body"])
 
 
-def preview(vault, repo, project, rule, folder):
+def preview(vault, repo, project, rule, folder, base):
     if os.environ.get("SHIP_SCHEDULED") == "1":
         return "Ship withheld: scheduled runs cannot ship."
     if rule == "notedbro" and not publish_scan.maintainer_ready(vault, denylist_path()):
         return publish_scan.MAINTAINER_MESSAGE
-    start = git(repo, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip()
-    git(repo, "fetch", check=False)
-    base = "origin/main"
-    if rule == "branch-pr" and git(repo, "rev-parse", "--verify", "origin/main", check=False).returncode != 0:
-        base = start
-    names = diff_names(repo, base)
+    github_repo(repo)
+    problem = fetch_base(repo, base)
+    if problem:
+        return problem
+    title, body, report_problem = report_from(repo)
+    if report_problem:
+        return "Ship withheld: " + report_problem
+    start = git(repo, "symbolic-ref", "--quiet", "--short", "HEAD", check=False).stdout.strip() or "HEAD"
+    base_ref = "origin/" + base
+    names = diff_names(repo, base_ref)
     if not names:
         return "Ship withheld: nothing to ship."
     unknown, private, scans = classify(vault, repo, names, folder if rule == "branch-pr" else "")
     blocked = f"blocked: {len(unknown)} unknown paths, {len(private)} private-folder files, {len(scans)} scan hits"
     if unknown or private or scans:
         return grouped(unknown, private, scans) + "\n" + blocked
-    title = title_from(repo)
     branch = branch_name(title)
-    body = pr_text(repo, title, names)
     scan_hits = publish_scan.scan_text(title + "\n" + body, publish_scan.read_terms(denylist_path()))
     if scan_hits:
         return "Ship withheld: the pull request text failed the scan.\n" + "\n".join(scan_hits) + "\n" + publish_scan.LOCAL_LINE
-    is_public = public_repo(repo)
+    auth = preflight(repo, branch, base, title, body, names)
+    if auth["existing"]:
+        return auth["existing"]
+    is_public = auth["public"]
     payload = {
         "project": project,
         "rule": rule,
@@ -241,22 +499,32 @@ def preview(vault, repo, project, rule, folder):
         "names": names,
         "title": title,
         "body": body,
+        "report_hash": hashlib.sha256((Path(repo) / "report.md").read_bytes()).hexdigest(),
         "public": is_public,
+        "method": auth["method"],
+        "account": auth["account"],
+        "owner": auth["owner"],
+        "name": auth["name"],
         "time": time.time(),
     }
     write_preview(payload)
     notice = "This PR is public.\n" if is_public else ""
     ask = "Ship? fnsh ship yes public" if is_public else "Ship? fnsh ship yes"
-    remote = git(repo, "remote", "get-url", "origin", check=False).stdout.strip()
     return "\n".join([
         f"Project: {project}",
         f"Folder: {folder}",
-        f"Remote: {remote}",
-        f"Branch: {branch}",
+        f"Repository: {auth['owner']}/{auth['name']}",
+        f"Authenticated account: {auth['account']}",
+        f"PR transport: {auth['method']}",
+        f"Head: {branch}",
+        f"Base: {base}",
+        f"Title: {title}",
+        "Body:",
+        body.rstrip(),
         "Files:",
         *[f"- {name}" for name in names],
         blocked,
-        notice + body,
+        notice.rstrip(),
         ask,
     ])
 
@@ -271,48 +539,75 @@ def apply_preview(confirm_public):
     if time.time() - payload["time"] > PREVIEW_SECONDS:
         return "Ship withheld: the preview expired."
     repo = payload["repo"]
-    names = diff_names(repo, payload["base"])
+    base = payload["base"]
+    title, body, report_problem = report_from(repo)
+    if report_problem:
+        return "Ship withheld: " + report_problem
+    current_report_hash = hashlib.sha256((Path(repo) / "report.md").read_bytes()).hexdigest()
+    if current_report_hash != payload.get("report_hash") or title != payload["title"] or body != payload["body"]:
+        return "Ship withheld: report.md changed. Preview again."
+    problem = fetch_base(repo, base)
+    if problem:
+        return problem
+    base_ref = "origin/" + base
+    names = diff_names(repo, base_ref)
     if file_hash(repo, names) != payload["hash"]:
         return "Ship withheld: the files changed. Ship again."
-    if payload["branch"] in {"main", "master"}:
-        return "Ship withheld: refusing to push main."
+    if payload["branch"] in {"main", "staging", "master"}:
+        return "Ship withheld: refusing to push a protected base branch."
     if payload.get("public") and not confirm_public:
         return "This PR is public.\nShip? fnsh ship yes public"
     unknown, private, scans = classify(payload.get("vault", repo), repo, names, payload["folder"] if payload["rule"] == "branch-pr" else "")
     if unknown or private or scans:
         return grouped(unknown, private, scans)
+    auth = preflight(repo, payload["branch"], base, title, body, names)
+    if (auth["method"], auth["account"], auth["owner"], auth["name"], auth["public"]) != (
+        payload["method"], payload["account"], payload["owner"], payload["name"], payload["public"]
+    ):
+        return "Ship withheld: authentication or repository visibility changed. Preview again."
+    if auth["existing"]:
+        return auth["existing"]
     saved = {}
     for name in names:
         path = Path(repo) / name
-        if path.is_file():
-            saved[name] = path.read_bytes()
-    if payload["rule"] == "notedbro":
-        git(repo, "checkout", "-f", "-B", payload["branch"], "origin/main")
+        saved[name] = path.read_bytes() if path.is_file() else None
+    existing_branch = git(repo, "show-ref", "--verify", "--quiet", "refs/heads/" + payload["branch"], check=False).returncode == 0
+    if existing_branch:
+        if not resumable_branch(repo, payload, base_ref):
+            return "Ship withheld: work branch already exists and does not exactly match this unpushed preview."
     else:
-        git(repo, "checkout", "-B", payload["branch"], "HEAD")
-    for name, data in saved.items():
-        path = Path(repo) / name
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_bytes(data)
-    git(repo, "add", "--", *names)
-    git(repo, "commit", "-m", payload["title"] + "\n\n" + payload["body"])
-    git(repo, "push", "-u", "origin", "HEAD:refs/heads/" + payload["branch"])
-    pushed = payload["branch"]
-    restore(repo, payload["rule"], payload["start"])
-    if git(repo, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip() == pushed:
-        return "Ship withheld: the checkout stayed on the feature branch."
-    url = git(repo, "remote", "get-url", "origin", check=False).stdout.strip()
-    compare = url.rstrip("/") + "/compare/" + pushed + "?expand=1"
-    proc = subprocess.run(
-        ["gh", "pr", "create", "--title", payload["title"], "--body-file", str(pr_path())],
-        cwd=repo, capture_output=True, text=True,
-    ) if shutil_which("gh") and os.environ.get("BRAIN_SHIP_GH") != "0" else None
-    if proc and proc.returncode == 0 and proc.stdout.strip():
-        return proc.stdout.strip()
-    return compare
+        git(repo, "switch", "-c", payload["branch"], "--no-track", base_ref)
+        for name, data in saved.items():
+            path = Path(repo) / name
+            if data is None:
+                if path.exists():
+                    path.unlink()
+                continue
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(data)
+        git(repo, "add", "--", *names)
+        git(repo, "commit", "-m", payload["title"], "-m", payload["body"])
+    upstream = git(repo, "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}", check=False).stdout.strip()
+    destination = "refs/heads/" + payload["branch"]
+    safety = push_destination_error(payload["branch"], upstream, destination)
+    if safety:
+        return "Ship withheld: " + safety + "."
+    unsafe = refspec_error(destination)
+    if unsafe:
+        return "Ship withheld: " + unsafe + "."
+    git(repo, "push", "-u", "origin", payload["branch"])
+    restore(repo, payload["start"])
+    return create_pr(repo, auth, payload["branch"], base, payload["title"], payload["body"])
 
 
 def resolve(argv, vault):
+    try:
+        return _resolve(argv, vault)
+    except (RuntimeError, OSError, ValueError) as error:
+        return "Ship withheld: " + safe_error(str(error))
+
+
+def _resolve(argv, vault):
     if os.environ.get("SHIP_SCHEDULED") == "1":
         return "Ship withheld: scheduled runs cannot ship."
     if argv[:1] == ["yes"]:
@@ -320,22 +615,22 @@ def resolve(argv, vault):
     project = argv[0] if argv else ""
     found = workspace_map.load_map(vault)
     match = None
-    for name, rule, folder in found.get("ships", []):
+    for name, rule, folder, base in found.get("ships", []):
         if not project or name.lower() == project.lower():
-            match = (name, rule, folder)
+            match = (name, rule, folder, base)
             if project:
                 break
     if project and (not match or match[0].lower() != project.lower()):
         return f"Ship withheld: no rule for {project}."
     if not match:
         return "Ship withheld: no rule for this project."
-    name, rule, folder = match
+    name, rule, folder, base = match
     if rule == "notedbro" and not publish_scan.maintainer_ready(vault, denylist_path()):
         return publish_scan.MAINTAINER_MESSAGE
     repo = folder
     if not Path(repo).is_dir():
         return f"Ship withheld: no folder for {name}."
-    text = preview(vault, repo, name, rule, folder)
+    text = preview(vault, repo, name, rule, folder, base)
     if preview_path().is_file() and "Ship?" in text:
         payload = json.loads(preview_path().read_text())
         payload["vault"] = str(vault)
@@ -345,109 +640,304 @@ def resolve(argv, vault):
 
 def self_check():
     import tempfile
-    env = os.environ
-    env["GIT_AUTHOR_NAME"] = "t"
-    env["GIT_COMMITTER_NAME"] = "t"
-    env["GIT_AUTHOR_EMAIL"] = "t" + "@" + "example.invalid"
-    env["GIT_COMMITTER_EMAIL"] = "t" + "@" + "example.invalid"
     with tempfile.TemporaryDirectory() as raw:
         root = Path(raw)
-        env["BRAIN_SHIP_PREVIEW"] = str(root / "ship-preview.json")
-        env["BRAIN_PR_FILE"] = str(root / "pr.md")
-        env["BRAIN_PUBLISH_DENYLIST"] = str(root / "deny")
-        (root / "deny").write_text("One\nTwo\nThree\n")
-        env["SHIP_SCHEDULED"] = "1"
-        if "scheduled" not in resolve([], root):
-            raise SystemExit("self-check: a scheduled run did not refuse")
-        env.pop("SHIP_SCHEDULED")
-        empty = root / "empty"
-        empty.mkdir()
-        before = {path.relative_to(empty).as_posix() for path in empty.rglob("*")}
-        (empty / "Workspace map.md").write_text(
-            "## Ship\n| Project | Rule | Folder |\n|---|---|---|\n| Kit | notedbro | /tmp/missing |\n"
+        env = os.environ
+        original_repo = github_repo
+        original_urlopen = urllib.request.urlopen
+        identity_repo = root / "identity"
+        subprocess.run(["git", "init", "-q", str(identity_repo)], check=True, env=child_env())
+        git(identity_repo, "remote", "add", "origin", "git" + "@github.com:example/repo.git")
+        if original_repo(identity_repo) != ("example", "repo"):
+            raise SystemExit("self-check: GitHub SSH origin was not resolved")
+        git(identity_repo, "config", "remote.origin.pushurl", "https://github.com/example/other.git")
+        try:
+            original_repo(identity_repo)
+            raise SystemExit("self-check: mismatched push URL was accepted")
+        except RuntimeError as error:
+            if "different GitHub repositories" not in str(error):
+                raise
+        git(identity_repo, "config", "--unset", "remote.origin.pushurl")
+        git(identity_repo, "remote", "set-url", "origin", "https://github.com/example/repo.git")
+        if original_repo(identity_repo) != ("example", "repo"):
+            raise SystemExit("self-check: GitHub HTTPS origin was not resolved")
+        git(identity_repo, "config", "--add", "remote.origin.pushurl", "https://github.com/example/repo.git")
+        git(identity_repo, "config", "--add", "remote.origin.pushurl", "https://github.com/example/other.git")
+        try:
+            original_repo(identity_repo)
+            raise SystemExit("self-check: multiple push URLs were accepted")
+        except RuntimeError as error:
+            if "exactly one" not in str(error):
+                raise
+        git(identity_repo, "config", "--unset-all", "remote.origin.pushurl")
+        git(identity_repo, "remote", "set-url", "origin", "https://fake-ship-token" + "@github.com/example/repo.git")
+        try:
+            original_repo(identity_repo)
+            raise SystemExit("self-check: credential-bearing remote was accepted")
+        except RuntimeError as error:
+            if "contains a credential" not in str(error):
+                raise
+        globals()["github_repo"] = lambda _repo: ("example", "repo")
+        api_state = {"mode": "ok", "calls": []}
+
+        def fake_urlopen(request, timeout=15):
+            auth = request.get_header("Authorization")
+            api_state["calls"].append((request.get_method(), request.full_url, auth, request.data))
+            if auth != "Bearer fake-ship-token":
+                raise AssertionError("self-check: API token was not sent in the request header")
+            mode = api_state["mode"]
+            if mode in {"invalid", "under-scoped"}:
+                code = 401 if mode == "invalid" else 403
+                raise urllib.error.HTTPError(request.full_url, code, "mock failure", {}, io.BytesIO())
+            if request.full_url.endswith("/user"):
+                data = {"login": "test-user"}
+            elif request.get_method() == "POST":
+                data = {"html_url": "https://github.com/example/repo/pull/2"}
+            elif "/pulls?" in request.full_url:
+                data = ([{"state": "open", "html_url": "https://github.com/example/repo/pull/1",
+                          "head": {"ref": "docs/update-the-starter-behavior", "repo": {"owner": {"login": "example"}}},
+                          "base": {"ref": "staging"}}] if mode == "existing" else [])
+            else:
+                data = {"full_name": "example/repo", "private": True}
+            return io.BytesIO(json.dumps(data).encode())
+
+        urllib.request.urlopen = fake_urlopen
+        env.update({
+            "GIT_AUTHOR_NAME": "test", "GIT_COMMITTER_NAME": "test",
+            "GIT_AUTHOR_EMAIL": "test" + "@" + "example.invalid",
+            "GIT_COMMITTER_EMAIL": "test" + "@" + "example.invalid",
+            "BRAIN_SHIP_PREVIEW": str(root / "ship-preview.json"),
+            "BRAIN_PR_FILE": str(root / "pr.md"),
+            "BRAIN_PUBLISH_DENYLIST": str(root / "deny"),
+            "BRAIN_SHIP_PUBLIC": "0",
+        })
+        fakebin = root / "bin"
+        fakebin.mkdir()
+        log = root / "gh-args.json"
+        gh = fakebin / "gh"
+        gh.write_text(
+            "#!/usr/bin/env python3\nimport json, os, sys\n"
+            "if any(os.environ.get(k) for k in ('NOTEDBRO_SHIP_TOKEN','GITHUB_TOKEN','GH_TOKEN')): sys.exit(77)\n"
+            "args=sys.argv[1:]\n"
+            "if args[:1]==['api']:\n"
+            " p=args[1]\n"
+            " if p=='/user': print(json.dumps({'login':'test-user'}))\n"
+            " elif '/pulls?' in p and os.environ.get('GH_PR_EXISTS')=='1': print(json.dumps([{'state':'open','html_url':'https://github.com/example/repo/pull/1','head':{'ref':'docs/update-the-starter-behavior','repo':{'owner':{'login':'example'}}},'base':{'ref':'staging'}}]))\n"
+            " elif '/pulls?' in p: print('[]')\n"
+            " else: print(json.dumps({'full_name':'example/repo','private':True}))\n"
+            "elif args[:2]==['pr','create']:\n"
+            " open(os.environ['GH_LOG'],'w').write(json.dumps(args))\n"
+            " print('https://github.com/example/repo/pull/1')\n"
         )
-        withheld = resolve(["Kit"], empty)
-        after = {path.relative_to(empty).as_posix() for path in empty.rglob("*")}
-        if "Maintainer only" not in withheld or before != {p for p in after if p != "Workspace map.md"}:
-            raise SystemExit(f"self-check: notedbro ship created a file:\n{withheld}")
-        vault = root / "vault"
+        gh.chmod(0o755)
+        store = fakebin / ("security" if sys.platform == "darwin" else "secret-tool")
+        store.write_text("#!/usr/bin/env python3\nimport os,sys\n"
+                         "if os.environ.get('STORE_ACTIVE')=='1': print('fake-ship-token')\n"
+                         "else: sys.exit(1)\n")
+        store.chmod(0o755)
+        env["GH_LOG"] = str(log)
+        env["PATH"] = str(fakebin) + os.pathsep + env.get("PATH", "")
+        env["GITHUB_TOKEN"] = "ci-token-must-be-ignored"
+        env["GH_TOKEN"] = "ci-gh-token-must-be-ignored"
+        (root / "deny").write_text("One\nTwo\nThree\n")
+        parsed = workspace_map.parse("## Ship\n| Project | Rule | Folder | Base |\n|---|---|---|---|\n| Default | branch-pr | /tmp/repo |  |\n| Main | branch-pr | /tmp/repo | main |\n")
+        if parsed["ships"][0][3] != "staging" or parsed["ships"][1][3] != "main":
+            raise SystemExit("self-check: Ship base default/override parsing failed")
+        if not push_destination_error("fix/abc", "origin/main", "refs/heads/fix/abc"):
+            raise SystemExit("self-check: origin/main upstream was allowed")
+        if not push_destination_error("fix/abc", "origin/staging", "refs/heads/fix/abc"):
+            raise SystemExit("self-check: origin/staging upstream was allowed")
+        if push_destination_error("fix/abc", "origin/fix/abc", "refs/heads/fix/abc"):
+            raise SystemExit("self-check: same-branch upstream was refused")
+        if not push_destination_error("fix/abc", "origin/fix/abc", "refs/heads/main"):
+            raise SystemExit("self-check: resolved main push destination was allowed")
+        if not refspec_error("HEAD:main") or not refspec_error("HEAD:staging"):
+            raise SystemExit("self-check: protected-base refspec was allowed")
+
+        vault, repo, origin = root / "vault", root / "repo", root / "origin.git"
         vault.mkdir()
-        (vault / "Workspace map.md").write_text("## Ship\n| Project | Rule | Folder |\n|---|---|---|\n")
-        if "no rule" not in resolve(["Missing"], vault):
-            raise SystemExit("self-check: a missing rule did not refuse")
-        files, dirs = [".gitignore"], [".github/"]
-        if not publish_scan.in_manifest(".gitignore", files, dirs):
-            raise SystemExit("self-check: .gitignore was not in the manifest")
-        if not publish_scan.in_manifest(".github/workflows/ci.yml", files, dirs):
-            raise SystemExit("self-check: .github/workflows/ci.yml was not in the manifest")
-        url = publish_scan.PUBLIC_REPO + "/actions"
-        if publish_scan.scan_text(url, ["fn" + "zh"]):
-            raise SystemExit("self-check: the public repo URL was scanned")
-        origin = root / "origin.git"
-        repo = root / "repo"
-        subprocess.run(["git", "init", "-q", "--bare", "-b", "main", str(origin)], check=True)
-        subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+        subprocess.run(["git", "init", "-q", "--bare", "-b", "main", str(origin)], check=True, env=child_env())
+        subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True, env=child_env())
         (repo / "README.md").write_text("hello\n")
+        report = "# Report\n\n## Change and reason\nUpdate the starter behavior.\n\n## Files touched\n- README.md\n\n## Files not touched\n- Other files.\n"
+        (repo / "report.md").write_text("---\ntags: [meta]\n---\n" + report)
+        title, body, problem = report_from(repo)
+        if problem or title != "Update the starter behavior" or "tags: [meta]" in body:
+            raise SystemExit("self-check: report frontmatter entered PR text")
+        (repo / "report.md").write_text(report)
         (repo / "_Scripts").mkdir()
-        (repo / "_Scripts" / "starter-manifest.txt").write_text("README.md\n_Scripts/\nWork/Example/Example.md\n")
-        (repo / "Work" / "Example").mkdir(parents=True)
-        (repo / "Work" / "Example" / "Example.md").write_text("hub\n")
-        git(repo, "add", "README.md", "_Scripts/starter-manifest.txt", "Work/Example/Example.md")
+        (repo / "_Scripts" / "starter-manifest.txt").write_text("README.md\nreport.md\n_Scripts/\n")
+        git(repo, "add", "README.md", "report.md", "_Scripts/starter-manifest.txt")
         git(repo, "commit", "-q", "-m", "start")
         git(repo, "remote", "add", "origin", str(origin))
         git(repo, "push", "-q", "-u", "origin", "main")
-        (vault / "Workspace map.md").write_text(
-            "## Maintainer\n- maintainer: yes\n\n## Ship\n"
-            "| Project | Rule | Folder |\n|---|---|---|\n"
-            f"| Example website | branch-pr | {repo} |\n"
-        )
-        (repo / "Personal").mkdir()
-        (repo / "Personal" / "note.md").write_text("secret\n")
-        git(repo, "add", "-f", "Personal/note.md")
-        env["BRAIN_SHIP_PUBLIC"] = "0"
-        env["BRAIN_SHIP_GH"] = "0"
-        reply = resolve(["Example website"], vault)
-        if "Personal/note.md" not in reply or "Ship?" in reply:
-            raise SystemExit(f"self-check: a private file was not blocked:\n{reply}")
-        git(repo, "rm", "-r", "--cached", "--quiet", "Personal")
-        subprocess.run(["git", "-C", str(repo), "clean", "-fd"], check=True)
-        (repo / "README.md").write_text("hello\nchanged " + "gh" + "p_" + "abcdefghij\n")
-        reply = resolve(["Example website"], vault)
-        if "****" not in reply or "Ship?" in reply:
-            raise SystemExit(f"self-check: a token was not blocked:\n{reply}")
+        git(repo, "switch", "-q", "-c", "staging")
+        git(repo, "push", "-q", "-u", "origin", "staging")
+        git(repo, "switch", "-q", "main")
         (repo / "README.md").write_text("hello\nchanged\n")
-        (repo / "Work" / "Example" / "my-note.md").write_text("nope\n")
-        git(repo, "add", "-f", "Work/Example/my-note.md")
-        reply = resolve(["Example website"], vault)
-        if "Work/" not in reply or "Ship?" in reply:
-            raise SystemExit(f"self-check: a hub note was not blocked:\n{reply}")
-        git(repo, "rm", "-r", "--cached", "--quiet", "--", "Work/Example/my-note.md")
-        (repo / "Work" / "Example" / "my-note.md").unlink()
-        (repo / "Work" / "Example" / "Example.md").write_text("hub changed\n")
-        env["BRAIN_SHIP_PUBLIC"] = "1"
-        reply = resolve(["Example website"], vault)
-        if "fnsh ship yes public" not in reply:
-            raise SystemExit(f"self-check: a manifest file did not preview:\n{reply}")
-        before = git(repo, "rev-parse", "main").stdout.strip()
-        if "yes public" not in resolve(["yes"], vault):
-            raise SystemExit("self-check: a public repo accepted the first yes")
-        if git(repo, "rev-parse", "main").stdout.strip() != before:
-            raise SystemExit("self-check: the first yes moved main")
-        pushed = resolve(["yes", "public"], vault)
-        if "compare" not in pushed:
-            raise SystemExit(f"self-check: ship did not push:\n{pushed}")
+        (repo / "report.md").write_text(report.replace("Update the starter behavior.", "Update the starter behavior."))
+        (vault / "Workspace map.md").write_text(
+            "## Ship\n| Project | Rule | Folder | Base |\n|---|---|---|---|\n"
+            f"| Example | branch-pr | {repo} | staging |\n"
+        )
+        main_before = git(repo, "rev-parse", "origin/main").stdout.strip()
+        staging_before = git(repo, "rev-parse", "origin/staging").stdout.strip()
+
+        (repo / "report.md").unlink()
+        if "report.md is missing" not in resolve(["Example"], vault):
+            raise SystemExit("self-check: missing report was not refused")
+        (repo / "report.md").write_text("# Report\n\n## Change and reason\nOnly one section.\n")
+        if "report.md is incomplete" not in resolve(["Example"], vault):
+            raise SystemExit("self-check: incomplete report was not refused")
+        (repo / "report.md").write_text(report.replace("Initial complete report.", "Update the starter behavior."))
+        git(origin, "update-ref", "-d", "refs/heads/staging")
+        git(repo, "update-ref", "-d", "refs/remotes/origin/staging")
+        missing = resolve(["Example"], vault)
+        if "origin/staging does not exist" not in missing:
+            raise SystemExit("self-check: missing base did not stop clearly")
+        if git(origin, "show-ref", "--verify", "--quiet", "refs/heads/staging", check=False).returncode == 0:
+            raise SystemExit("self-check: missing base was created")
+        git(origin, "update-ref", "refs/heads/staging", staging_before)
+        git(repo, "fetch", "origin")
+        (vault / "Workspace map.md").write_text(
+            "## Ship\n| Project | Rule | Folder | Base |\n|---|---|---|---|\n"
+            f"| Example | branch-pr | {repo} | main |\n"
+        )
+        main_preview = resolve(["Example"], vault)
+        if "Base: main" not in main_preview:
+            raise SystemExit("self-check: explicit Base: main was not visible before confirmation")
+        (vault / "Workspace map.md").write_text(
+            "## Ship\n| Project | Rule | Folder | Base |\n|---|---|---|---|\n"
+            f"| Example | branch-pr | {repo} | staging |\n"
+        )
+        preview_text = resolve(["Example"], vault)
+        env["GH_PR_EXISTS"] = "1"
+        if resolve(["Example"], vault) != "https://github.com/example/repo/pull/1":
+            raise SystemExit("self-check: gh path did not report an existing PR")
+        env.pop("GH_PR_EXISTS")
+        if "Base: staging" not in preview_text or "Title: Update the starter behavior" not in preview_text:
+            raise SystemExit(f"self-check: preview omitted title/base:\n{preview_text}")
+        if "## Files touched" not in preview_text:
+            raise SystemExit("self-check: PR body did not come from report.md")
+        (repo / "report.md").write_text("# Report\n\n## Change and reason\nIncomplete after preview.\n")
+        if "report.md is incomplete" not in resolve(["yes"], vault):
+            raise SystemExit("self-check: incomplete report was not refused at confirmation")
+        (repo / "report.md").write_text(report.replace("Update the starter behavior.", "A different complete report."))
+        if "report.md changed" not in resolve(["yes"], vault):
+            raise SystemExit("self-check: changed report was not refused at confirmation")
+        (repo / "report.md").write_text(report.replace("Initial complete report.", "Update the starter behavior."))
+        preview_text = resolve(["Example"], vault)
+        if "Ship? fnsh ship yes" not in preview_text:
+            raise SystemExit("self-check: updated report could not be previewed again")
+
+        # The integration path uses only a temporary bare remote and a mocked gh.
+        result = resolve(["yes"], vault)
+        if result != "https://github.com/example/repo/pull/1":
+            raise SystemExit(f"self-check: mocked PR did not return its link: {result}")
+        args = json.loads(log.read_text())
+        if args[:4] != ["pr", "create", "--repo", "example/repo"] or args[args.index("--base") + 1] != "staging" or "--head" not in args:
+            raise SystemExit(f"self-check: PR command omitted explicit head/base: {args}")
+        branch = args[args.index("--head") + 1]
+        upstream = git(repo, "rev-parse", "--abbrev-ref", "--symbolic-full-name", branch + "@{upstream}").stdout.strip()
+        if upstream != "origin/" + branch:
+            raise SystemExit(f"self-check: wrong work-branch upstream: {upstream}")
+        if git(repo, "rev-parse", branch + "^").stdout.strip() != staging_before:
+            raise SystemExit("self-check: work branch was not created from origin/staging")
+        commit = git(repo, "show", "-s", "--format=%B", branch).stdout
+        if "## Files touched" not in commit:
+            raise SystemExit("self-check: commit body was not derived from report.md")
+        body_file = Path(args[args.index("--body-file") + 1])
+        if "## Files touched" not in body_file.read_text():
+            raise SystemExit("self-check: PR body file was not derived from report.md")
+        if git(repo, "rev-parse", "origin/main").stdout.strip() != main_before or git(repo, "rev-parse", "origin/staging").stdout.strip() != staging_before:
+            raise SystemExit("self-check: work-branch push moved a protected base")
         if git(repo, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip() != "main":
-            raise SystemExit("self-check: branch-pr did not return to the start branch")
-        if git(repo, "rev-parse", "main").stdout.strip() != before:
-            raise SystemExit("self-check: branch-pr reset main")
-        stale = json.loads(preview_path().read_text())
-        stale["time"] = time.time() - PREVIEW_SECONDS - 5
-        preview_path().write_text(json.dumps(stale))
-        if "expired" not in resolve(["yes"], vault):
-            raise SystemExit("self-check: an expired preview was accepted")
-        if "reset --hard" in Path(__file__).read_text().split("def self_check", 1)[0]:
-            raise SystemExit("self-check: ship contains a hard reset")
+            raise SystemExit("self-check: checkout was not restored before PR creation")
+        git(repo, "push", "-u", "origin", branch)
+
+        git(origin, "update-ref", "-d", "refs/heads/" + branch)
+        repo2 = root / "repo2"
+        subprocess.run(["git", "clone", "-q", str(origin), str(repo2)], check=True, env=child_env())
+        (repo2 / "README.md").write_text("hello\nchanged again\n")
+        (vault / "Workspace map.md").write_text(
+            "## Ship\n| Project | Rule | Folder | Base |\n|---|---|---|---|\n"
+            f"| Example | branch-pr | {repo2} | staging |\n"
+        )
+        env["NOTEDBRO_SHIP_TOKEN"] = "fake-ship-token"
+        original_run = subprocess.run
+
+        def checked_run(args, **kwargs):
+            secrets = ("fake-ship-token", "ci-token-must-be-ignored", "ci-gh-token-must-be-ignored")
+            child = kwargs.get("env") or os.environ
+            if any(secret in " ".join(map(str, args)) or any(secret in value for value in child.values())
+                   for secret in secrets):
+                raise AssertionError("self-check: a token reached child argv or environment")
+            return original_run(args, **kwargs)
+
+        subprocess.run = checked_run
+        api_state["mode"] = "invalid"
+        if "invalid or expired" not in resolve(["Example"], vault):
+            raise SystemExit("self-check: invalid token did not stop before push")
+        api_state["mode"] = "under-scoped"
+        if "cannot access" not in resolve(["Example"], vault):
+            raise SystemExit("self-check: under-scoped token did not stop before push")
+        if git(origin, "show-ref", "--verify", "--quiet", "refs/heads/" + branch, check=False).returncode == 0:
+            raise SystemExit("self-check: invalid token pushed a branch")
+        api_state["mode"] = "existing"
+        if resolve(["Example"], vault) != "https://github.com/example/repo/pull/1":
+            raise SystemExit("self-check: existing PR was not reported before push")
+        if git(origin, "show-ref", "--verify", "--quiet", "refs/heads/" + branch, check=False).returncode == 0:
+            raise SystemExit("self-check: existing PR caused a push")
+        api_state["mode"] = "ok"
+        env["BRAIN_SHIP_PUBLIC"] = "1"
+        token_preview = resolve(["Example"], vault)
+        if ("PR transport: token" not in token_preview or "Authenticated account: test-user" not in token_preview
+                or "fnsh ship yes public" not in token_preview):
+            raise SystemExit("self-check: token preview omitted transport or account")
+        api_state["mode"] = "existing"
+        if resolve(["yes", "public"], vault) != "https://github.com/example/repo/pull/1":
+            raise SystemExit("self-check: PR appearing after preview was not reported")
+        if git(origin, "show-ref", "--verify", "--quiet", "refs/heads/" + branch, check=False).returncode == 0:
+            raise SystemExit("self-check: PR appearing after preview caused a push")
+        api_state["mode"] = "ok"
+        token_preview = resolve(["Example"], vault)
+        if "yes public" not in resolve(["yes"], vault):
+            raise SystemExit("self-check: public PR accepted the first yes")
+        if git(origin, "show-ref", "--verify", "--quiet", "refs/heads/" + branch, check=False).returncode == 0:
+            raise SystemExit("self-check: first public yes pushed a branch")
+        token_result = resolve(["yes", "public"], vault)
+        env["BRAIN_SHIP_PUBLIC"] = "0"
+        if token_result != "https://github.com/example/repo/pull/2":
+            raise SystemExit(f"self-check: token PR path failed: {token_result}")
+        posts = [call for call in api_state["calls"] if call[0] == "POST"]
+        if len(posts) != 1 or json.loads(posts[0][3]) != {
+            "head": branch, "base": "staging", "title": "Update the starter behavior", "body": report_from(repo2)[1]
+        }:
+            raise SystemExit("self-check: API PR creation omitted explicit report-derived fields")
+        for path in (preview_path(), pr_path(), repo2 / "report.md", repo2 / ".git" / "config"):
+            if "fake-ship-token" in path.read_text():
+                raise SystemExit(f"self-check: token appeared in {path.name}")
+        if "fake-ship-token" in token_preview + token_result + git(repo2, "show", "-s", "--format=%B", branch).stdout:
+            raise SystemExit("self-check: token appeared in preview, result, or commit")
+        env.pop("NOTEDBRO_SHIP_TOKEN")
+        env["STORE_ACTIVE"] = "1"
+        method, stored = transport()
+        if (method, stored) != ("token", "fake-ship-token"):
+            raise SystemExit("self-check: OS credential store token was not selected")
+        env.pop("STORE_ACTIVE")
+        env["BRAIN_SHIP_GH"] = "0"
+        try:
+            transport()
+            raise SystemExit("self-check: missing credentials did not stop clearly")
+        except RuntimeError as error:
+            if "provide NOTEDBRO_SHIP_TOKEN" not in str(error):
+                raise
+        env.pop("BRAIN_SHIP_GH")
+        subprocess.run = original_run
+        globals()["github_repo"] = original_repo
+        urllib.request.urlopen = original_urlopen
     print("self-check ok")
+
 
 
 def main(argv):

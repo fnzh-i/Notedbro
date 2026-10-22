@@ -27,7 +27,7 @@ def ship_folders(vault):
     import workspace_map
     found = workspace_map.load_map(vault)
     folders = set()
-    for _project, _rule, folder in found.get("ships", []):
+    for _project, _rule, folder, *_base in found.get("ships", []):
         if not folder:
             continue
         path = Path(folder)

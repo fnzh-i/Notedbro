@@ -34,7 +34,7 @@ Optional fnsh shadow builds an encrypted snapshot using age and zstd. Keep its p
 
 ## Ship and updates
 
-fnsh ship uses explicit project rules, scans files, previews, and asks for confirmation before pushing a feature branch. Public confirmation is a separate step. Plain git push bypasses these checks. Keep maintainer rules disabled in personal copies.
+fnsh ship uses explicit project rules and the configured base (`staging` by default; `main` only when explicitly selected). It requires a complete root `report.md` for the commit and pull-request title and body. It scans selected files, confirms the GitHub account and repository, checks for a matching open pull request before any push, and previews the exact head, base, and PR text before confirmation. Public confirmation is a separate step. A dedicated Ship token handles GitHub API calls, or authenticated `gh` is used when no Ship token is available; Git push uses ordinary Git credentials. See [How to use the brain](How%20to%20use%20the%20brain.md) for token handling and credential-store details. Plain git push bypasses these checks. Keep maintainer rules disabled in personal copies.
 
 fnsh upgrade check reads GitHub metadata. Automatic remote archive installation is incomplete in 1.1.0. Use [Migration 1.1.0](Migration%201.1.0.md). The existing local-source upgrade machinery covers scripts and supporting unit files, not your customized rules, templates, or notes.
 

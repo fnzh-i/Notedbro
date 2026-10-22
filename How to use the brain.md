@@ -45,6 +45,14 @@ Start at [[Index]]. Review [[Preferences]] for style and [[Parameters]] for stan
 
 Setup generates Decisions and sessions.canvas. It begins empty and updates as local sessions and decisions are filed. Open it in Obsidian if desired. Graph colors are optional manual settings; see [[Graph colors]]. The repository screenshot shows an established, customized installation.
 
+## Ship pull-request transport
+
+Ship takes a token from `NOTEDBRO_SHIP_TOKEN` first, then the OS credential store (`security find-generic-password -s notedbro-ship -a github -w` on macOS or `secret-tool lookup service notedbro-ship account github` on Linux), then authenticated `gh`. It ignores `GITHUB_TOKEN` and `GH_TOKEN`, including when invoking `gh`. A supplied invalid token stops Ship; it does not fall back to another identity. If none is available, Ship explains how to provide one.
+
+Use a fine-grained GitHub token restricted to the repositories you ship, with Contents read/write and Pull requests write. The token is used only for GitHub API identity, repository, and pull-request calls. Those calls run inside Ship using Python `urllib`; the token is never passed in command arguments or a child-process environment. Git commits are local, and `git push` continues to use your normal SSH or Git credential helper. Ship never writes a token to the vault, Workspace map, `report.md`, preview files, logs, Git configuration, commits, or PR text.
+
+Before preview and again before pushing, Ship confirms the authenticated account and target repository, then checks for an open PR with the same head and configured base. An existing PR is reported by URL without a push. The preview shows the account, PR transport, title, body, head, base, and public-repository confirmation when applicable. After confirmation, a new PR is created with explicit head, base, and `report.md` title and body; Ship then stops. Review-change pushes to the same work branch require an explicit request and the usual destination checks.
+
 ## More commands
 
 The full phrase reference is [[Prefixes]]. Backups, project routing, shipping, and upgrade limitations are covered in [[Advanced configuration]]. Publication and synchronization belong to [[Maintainer guide]]. Recovery and removal steps are in [[Troubleshooting]].

@@ -104,7 +104,8 @@ def parse(text):
             found["maintainer"] = True
     for row in table_rows(parts.get("ship", [])):
         if len(row) >= 3 and row[0] and row[1]:
-            found["ships"].append((row[0], row[1].strip().lower(), expand(row[2])))
+            base = row[3].strip().lower() if len(row) >= 4 and row[3] else "staging"
+            found["ships"].append((row[0], row[1].strip().lower(), expand(row[2]), base))
     return found
 
 
