@@ -234,12 +234,33 @@ def classify(vault, repo, names, project_folder):
     return unknown, private, scans
 
 
-def report_from(repo):
+def report_hash(repo):
+    path = Path(repo) / "report.md"
+    if not path.is_file():
+        return "missing"
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def report_from(repo, project, base):
     path = Path(repo) / "report.md"
     if path.is_symlink():
         return None, None, "report.md cannot be a symlink."
     if not path.is_file():
-        return None, None, "report.md is missing."
+        names = diff_names(repo, base)
+        if not names:
+            return None, None, "nothing to ship."
+        title = re.sub(r"\s+", " ", f"Update {project}").strip()[:80]
+        body = "\n".join([
+            "## Change and reason",
+            f"Ship the current {project} changes; report.md was not available.",
+            "",
+            "## Files touched",
+            *[f"- {name}" for name in names],
+            "",
+            "## Files not touched",
+            "Not specified; this description was generated from the changed files.",
+        ])
+        return title, body + "\n", None
     text = path.read_text(errors="replace").strip()
     sections = {}
     current = None
@@ -589,6 +610,19 @@ def recovery_record(vault, repo, project, base, expected):
 
 
 def format_preview(payload, auth, recovery=False):
+    if payload.get("local_only"):
+        return "\n".join([
+            f"Project: {payload['project']}",
+            f"Folder: {payload['folder']}",
+            "Mode: local commit only",
+            f"Head: {payload['branch']}",
+            f"Base: {payload['base']}",
+            f"Title: {payload['title']}",
+            "Body:", payload["body"].rstrip(),
+            "Files:", *[f"- {name}" for name in payload["names"]],
+            "report.md was not available; confirmation will create the local commit only. Nothing will be pushed.",
+            "Ship? fnsh ship yes",
+        ])
     notice = "This PR is public." if auth["public"] else ""
     ask = "Ship? fnsh ship yes public" if auth["public"] else "Ship? fnsh ship yes"
     return "\n".join([
@@ -616,12 +650,13 @@ def preview(vault, repo, project, rule, folder, base, expected):
     problem = fetch_base(repo, base)
     if problem:
         return problem
-    title, body, report_problem = report_from(repo)
+    base_ref = "origin/" + base
+    title, body, report_problem = report_from(repo, project, base_ref)
     if report_problem:
         return "Ship withheld: " + report_problem
     pending = recovery_record(vault, repo, project, base, expected)
     if pending:
-        if (hashlib.sha256((Path(repo) / "report.md").read_bytes()).hexdigest() != pending["report_hash"]
+        if (report_hash(repo) != pending["report_hash"]
                 or title != pending["title"] or body != pending["body"]):
             return "Ship withheld: report.md changed since the branch was pushed. Review the pushed branch before continuing."
         if changed_work_files(repo):
@@ -637,7 +672,6 @@ def preview(vault, repo, project, rule, folder, base, expected):
         write_preview(pending)
         return format_preview(pending, auth, recovery=True)
     start = git(repo, "symbolic-ref", "--quiet", "--short", "HEAD", check=False).stdout.strip() or "HEAD"
-    base_ref = "origin/" + base
     names = diff_names(repo, base_ref)
     if not names:
         return "Ship withheld: nothing to ship."
@@ -649,9 +683,15 @@ def preview(vault, repo, project, rule, folder, base, expected):
     scan_hits = publish_scan.scan_text(title + "\n" + body, publish_scan.read_terms(denylist_path()))
     if scan_hits:
         return "Ship withheld: the pull request text failed the scan.\n" + "\n".join(scan_hits) + "\n" + publish_scan.LOCAL_LINE
-    auth = preflight(vault, repo, expected, branch, base, title, body, names)
-    if auth["existing"]:
-        return auth["existing"]
+    local_only = report_hash(repo) == "missing"
+    if local_only:
+        owner, name = expected.split("/", 1)
+        auth = {"method": "local", "account": "not used", "owner": owner, "name": name,
+                "public": False, "existing": None, "expiry": None, "token": None}
+    else:
+        auth = preflight(vault, repo, expected, branch, base, title, body, names)
+        if auth["existing"]:
+            return auth["existing"]
     is_public = auth["public"]
     payload = {
         "project": project,
@@ -666,7 +706,8 @@ def preview(vault, repo, project, rule, folder, base, expected):
         "names": names,
         "title": title,
         "body": body,
-        "report_hash": hashlib.sha256((Path(repo) / "report.md").read_bytes()).hexdigest(),
+        "report_hash": report_hash(repo),
+        "local_only": local_only,
         "public": is_public,
         "method": auth["method"],
         "account": auth["account"],
@@ -699,16 +740,16 @@ def apply_preview(confirm_public):
             payload["folder"], base, payload.get("expected")):
         return "Ship withheld: Ship configuration changed. Preview again."
     github_repo(repo, payload["expected"])
-    title, body, report_problem = report_from(repo)
-    if report_problem:
-        return "Ship withheld: " + report_problem
-    current_report_hash = hashlib.sha256((Path(repo) / "report.md").read_bytes()).hexdigest()
-    if current_report_hash != payload.get("report_hash") or title != payload["title"] or body != payload["body"]:
-        return "Ship withheld: report.md changed. Preview again."
     problem = fetch_base(repo, base)
     if problem:
         return problem
     base_ref = "origin/" + base
+    title, body, report_problem = report_from(repo, payload["project"], base_ref)
+    if report_problem:
+        return "Ship withheld: " + report_problem
+    current_report_hash = report_hash(repo)
+    if current_report_hash != payload.get("report_hash") or title != payload["title"] or body != payload["body"]:
+        return "Ship withheld: report.md changed. Preview again."
     recovering = payload.get("phase") == "recovery-preview"
     names = [] if recovering else diff_names(repo, base_ref)
     if not recovering and file_hash(repo, names) != payload["hash"]:
@@ -720,13 +761,16 @@ def apply_preview(confirm_public):
     unknown, private, scans = classify(vault, repo, names, payload["folder"] if payload["rule"] == "branch-pr" else "")
     if unknown or private or scans:
         return grouped(unknown, private, scans)
-    auth = preflight(vault, repo, payload["expected"], payload["branch"], base, title, body, names)
-    if (auth["method"], auth["account"], auth["owner"], auth["name"], auth["public"]) != (
-        payload["method"], payload["account"], payload["owner"], payload["name"], payload["public"]
-    ):
-        return "Ship withheld: authentication or repository visibility changed. Preview again."
-    if auth["existing"]:
-        return auth["existing"]
+    if payload.get("local_only"):
+        auth = None
+    else:
+        auth = preflight(vault, repo, payload["expected"], payload["branch"], base, title, body, names)
+        if (auth["method"], auth["account"], auth["owner"], auth["name"], auth["public"]) != (
+            payload["method"], payload["account"], payload["owner"], payload["name"], payload["public"]
+        ):
+            return "Ship withheld: authentication or repository visibility changed. Preview again."
+        if auth["existing"]:
+            return auth["existing"]
     if recovering:
         sha = payload.get("commit_sha")
         if changed_work_files(repo) or not sha or (
@@ -756,18 +800,50 @@ def apply_preview(confirm_public):
         path.write_bytes(data)
     git(repo, "add", "--", *names)
     git(repo, "commit", "-m", payload["title"], "-m", payload["body"])
+    payload["commit_sha"] = git(repo, "rev-parse", "HEAD").stdout.strip()
+    if payload.get("local_only"):
+        payload["phase"] = "local-only"
+        try:
+            write_preview(payload)
+        except (RuntimeError, OSError, ValueError):
+            pass
+        return (
+            f"Ship withheld: report.md was unavailable. Commit {payload['commit_sha']} remains local "
+            f"on branch {payload['branch']}; nothing was pushed. Review it and push manually."
+        )
     upstream = git(repo, "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}", check=False).stdout.strip()
     destination = "refs/heads/" + payload["branch"]
     safety = push_destination_error(payload["branch"], upstream, destination)
     if safety:
-        return "Ship withheld: " + safety + "."
+        return (
+            f"Ship withheld: commit {payload['commit_sha']} remains local on branch "
+            f"{payload['branch']}; nothing was pushed. Review it and push manually. "
+            f"Push refused: {safety}."
+        )
     unsafe = refspec_error(destination)
     if unsafe:
-        return "Ship withheld: " + unsafe + "."
-    payload["commit_sha"] = git(repo, "rev-parse", "HEAD").stdout.strip()
+        return (
+            f"Ship withheld: commit {payload['commit_sha']} remains local on branch "
+            f"{payload['branch']}; nothing was pushed. Review it and push manually. "
+            f"Push refused: {unsafe}."
+        )
     payload["phase"] = "ready-to-push"
-    write_preview(payload)
-    git(repo, "push", "-u", "origin", payload["branch"])
+    try:
+        write_preview(payload)
+    except (RuntimeError, OSError, ValueError) as error:
+        return (
+            f"Ship withheld: commit {payload['commit_sha']} remains local on branch "
+            f"{payload['branch']}; nothing was pushed. Review it and push manually. "
+            f"Ship state could not be saved: {safe_error(str(error))}"
+        )
+    try:
+        git(repo, "push", "-u", "origin", payload["branch"])
+    except (RuntimeError, OSError, ValueError) as error:
+        return (
+            f"Ship withheld: commit {payload['commit_sha']} remains local on branch "
+            f"{payload['branch']}; push was not completed. Review it and push manually. "
+            f"Push failed: {safe_error(str(error))}"
+        )
     payload["phase"] = "pushed"
     try:
         write_preview(payload)
@@ -1019,8 +1095,20 @@ def self_check():
         staging_before = git(repo, "rev-parse", "origin/staging").stdout.strip()
 
         (repo / "report.md").unlink()
-        if "report.md is missing" not in resolve(["Example"], vault):
-            raise SystemExit("self-check: missing report was not refused")
+        missing_preview = resolve(["Example"], vault)
+        if "Mode: local commit only" not in missing_preview or "report.md was not available" not in missing_preview:
+            raise SystemExit("self-check: missing report did not produce a local-only preview")
+        missing_result = resolve(["yes"], vault)
+        if "nothing was pushed" not in missing_result or "report.md was unavailable" not in missing_result:
+            raise SystemExit("self-check: missing report did not create a local-only commit")
+        local_branch = "docs/update-example"
+        if git(repo, "show-ref", "--verify", "--quiet", "refs/heads/" + local_branch, check=False).returncode:
+            raise SystemExit("self-check: missing report did not create the local branch")
+        if git(origin, "show-ref", "--verify", "--quiet", "refs/heads/" + local_branch, check=False).returncode == 0:
+            raise SystemExit("self-check: missing report pushed the local-only branch")
+        git(repo, "switch", "-q", "main")
+        git(repo, "restore", "--source=main", "--", "README.md", "report.md")
+        (repo / "README.md").write_text("hello\nchanged\n")
         (repo / "report.md").write_text("# Report\n\n## Change and reason\nOnly one section.\n")
         if "report.md is incomplete" not in resolve(["Example"], vault):
             raise SystemExit("self-check: incomplete report was not refused")
@@ -1149,7 +1237,8 @@ def self_check():
             raise SystemExit(f"self-check: token PR path failed: {token_result}")
         posts = [call for call in api_state["calls"] if call[0] == "POST"]
         if len(posts) != 1 or json.loads(posts[0][3]) != {
-            "head": branch, "base": "staging", "title": "Update the starter behavior", "body": report_from(repo2)[1]
+            "head": branch, "base": "staging", "title": "Update the starter behavior",
+            "body": report_from(repo2, "Example", "origin/staging")[1]
         }:
             raise SystemExit("self-check: API PR creation omitted explicit report-derived fields")
         for path in (preview_path(), pr_path(), repo2 / "report.md", repo2 / ".git" / "config"):
