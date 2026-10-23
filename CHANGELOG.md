@@ -2,6 +2,8 @@
 
 One dated line per pull request, newest first. Written in the pull request; sync never writes it.
 
+- 2026-10-23 — Added fail-fast runtime diagnostics, clean-export release validation, reconciliation review, and explicit cross-platform release evidence.
+
 - 2026-10-22 — Added cross-platform Ship token setup, repository validation, safe PR recovery, and Windows checks.
 
 - 2026-10-22 — Made GitHub CLI optional for Ship with secure token-backed PR calls, pre-push duplicate checks, and explicit base and report safeguards.
