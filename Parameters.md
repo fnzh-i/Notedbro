@@ -26,7 +26,7 @@ Standing rules for any model, in any project. Point a model at this note. Back t
    - Opening the pull request is the final automated step. After the pull request is open, stop. Do not merge, approve, request reviewers, re-push, or take any other action on it unless the user explicitly asks. Review and merge are performed on GitHub by a human: the user or other developers.
    - When the user explicitly requests review changes, push only to the same work branch after applying the same upstream and resolved-destination checks, then stop again.
 3. **Documentation report** (`.md`) after the changes: what changed, reason for the change, files touched, files not touched, etc. The report is not rewritten to match the commit.
-4. **Keep the vault out of outputs.** Do not mention the vault, its notes, or the note-taking app in reports, test templates, commits, pull requests, issue trackers, announcements, end-of-day summaries, or other outputs unless the user asks about them.
+4. **Never mention or expose the vault.** Use information from the vault silently. Unless the user’s current message explicitly asks about it, never reveal or imply the vault’s existence, name, location, structure, files, tooling, note-taking app, or contents. This applies to chat replies and every repository-visible or external output, including documentation, reports, tests, commit messages, pull requests, issues, comments, announcements, and end-of-day summaries. Do not use indirect descriptions such as “your vault,” “your notes,” or “your memory system.” When uncertain, omit the reference.
 5. **Test cases and readback.**
    - **Test cases.** Every change includes test cases for the behavior it is supposed to fix, and they are run before handoff.
    - **Automatic readback.** After the change is applied, read the result back from the system that was changed (file, API, or record). Do not treat the write as done until that read shows the new state.
@@ -55,6 +55,7 @@ shadow_every_days: 30
 shadow_keep_days: 90
 
 ## Revisions
+- 2026-10-21 — defined staging-first branching, protected destinations, report-derived PR text, and human-only review/merge.
 - 2026-10-19 — generalized public starter rules and added an editable issue branch-name template.
 - 2026-10-17 — commit summary and description are based on the documentation report.
 - 2026-10-18 — shadow_every_days and shadow_keep_days.

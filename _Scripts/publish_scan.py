@@ -40,7 +40,7 @@ PUBLIC_SLUG = PUBLIC_REPO.split("github.com/", 1)[1]
 ALLOWED_URL = re.compile(
     "(?:" + re.escape(PUBLIC_REPO) + "|" + re.escape(PUBLIC_API) + ")"
     + r"[A-Za-z0-9/._#?=&-]*|(?<![A-Za-z0-9/._-])"
-    + re.escape(PUBLIC_SLUG) + r"(?![A-Za-z0-9._-])"
+    + re.escape(PUBLIC_SLUG) + r"(?![A-Za-z0-9_-]|\.[A-Za-z0-9])"
 )
 
 
@@ -151,8 +151,7 @@ def _line_hits(text, terms, home, login, product_name, allow_product, rel=""):
         if home and home in line:
             kinds.append("home folder")
         # GitHub Actions exposes its OS through the exact expression
-        # `runner.os`.  A runner login must still be found everywhere else,
-        # including other text in this workflow.
+        # `runner.os`. A runner login must still be found everywhere else.
         login_line = line
         if login.pattern.endswith("runner(?![A-Za-z0-9_-])") and rel == ".github/workflows/ci.yml":
             login_line = re.sub(r"(?<![A-Za-z0-9_-])runner\.os(?![A-Za-z0-9_-])", "", line)

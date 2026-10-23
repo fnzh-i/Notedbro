@@ -143,7 +143,7 @@ def _win_check(path, directory=False, repair=False):
 
 
 def _win_secure(path, directory=False):
-    """Set the current user as owner and sole effective ACL entry in-process."""
+    """Set a private owner/SYSTEM/Administrators DACL without a child process."""
     from ctypes import wintypes
 
     adv = ctypes.WinDLL("advapi32", use_last_error=True)
@@ -168,9 +168,6 @@ def _win_secure(path, directory=False):
         sid = _sid_string(ctypes.c_void_p.from_buffer(buf).value, adv)
     finally:
         kernel.CloseHandle(token)
-    # Set owner and DACL together.  A newly created directory can inherit an
-    # unexpected owner from a CI temporary directory, so DACL-only repair is
-    # insufficient before token bytes are written.
     sddl = "O:" + sid + "D:P(A;" + ("OICI" if directory else "") + ";FA;;;" + sid + ")"
     descriptor = ctypes.c_void_p()
     adv.ConvertStringSecurityDescriptorToSecurityDescriptorW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, ctypes.POINTER(ctypes.c_void_p), ctypes.c_void_p]

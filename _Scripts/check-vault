@@ -34,6 +34,7 @@ SKIP = {".git", ".obsidian", "Skill files", "_Scripts", "_Templates", "_Config"}
 REPO_DOCS = {
     "Advanced configuration.md", "Maintainer guide.md", "Troubleshooting.md",
     "Migration 1.1.0.md", "Release 1.1.0.md", "Change report 1.1.0.md",
+    "Workspace map.example.md", "Workspace map.advanced.example.md",
     "README.md", "Prerequisites.md", "How to set up.md", "SECURITY.md", "CONTRIBUTING.md",
     "DESIGN.md", "CHANGELOG.md", "CODE_OF_CONDUCT.md", "AGENTS.md", "CLAUDE.md",
 }
