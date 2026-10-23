@@ -5,19 +5,38 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import migration
 
-root = Path(__file__).resolve().parent.parent
-lines = ["# Notedbro 1.1.0 runtime checksums. Regenerate after changing shipped runtime files."]
-for rel, path in sorted(migration.release_files(root).items()):
-    if rel.startswith("_Scripts/") and path.suffix != ".sha256":
-        lines.append(migration.sha(path) + "  " + rel)
-output = root / "_Scripts/release-runtime.sha256"
-data = "\n".join(lines) + "\n"
-if len(sys.argv) == 2 and sys.argv[1] == "--check":
-    if not output.exists() or output.read_bytes() != data.encode("utf-8"):
-        raise SystemExit("Runtime checksum manifest is stale; run python3 _Scripts/build-runtime-manifest.")
-elif len(sys.argv) == 1:
-    if not output.exists() or output.read_bytes() != data.encode("utf-8"):
-        output.write_bytes(data.encode("utf-8"))
-else:
-    raise SystemExit("Usage: build-runtime-manifest [--check]")
-print(f"Runtime checksums: {len(lines) - 1} files")
+HEADER = "# Notedbro 1.1.0 runtime checksums. Regenerate after changing shipped runtime files."
+
+
+def render(root):
+    lines = [HEADER]
+    for rel, path in sorted(migration.release_files(root).items()):
+        if rel.startswith("_Scripts/") and path.suffix != ".sha256":
+            lines.append(migration.sha(path) + "  " + rel)
+    return ("\n".join(lines) + "\n").encode("utf-8")
+
+
+def write_manifest(root):
+    root = Path(root)
+    data = render(root)
+    (root / "_Scripts/release-runtime.sha256").write_bytes(data)
+    return len(data.splitlines()) - 1
+
+
+def main(argv):
+    root = Path(__file__).resolve().parent.parent
+    output = root / "_Scripts/release-runtime.sha256"
+    data = render(root)
+    if len(argv) == 1 and argv[0] == "--check":
+        if not output.exists() or output.read_bytes() != data:
+            raise SystemExit("Runtime checksum manifest is stale; run python3 _Scripts/build-runtime-manifest.")
+    elif not argv:
+        if not output.exists() or output.read_bytes() != data:
+            output.write_bytes(data)
+    else:
+        raise SystemExit("Usage: build-runtime-manifest [--check]")
+    print(f"Runtime checksums: {len(data.splitlines()) - 1} files")
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])
