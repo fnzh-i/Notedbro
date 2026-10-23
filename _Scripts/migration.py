@@ -7,7 +7,7 @@ import subprocess
 BASE_COMMIT = "3183f11e60a48e8e7dbce4ef8e28267a5031862c"
 SOURCE = Path(__file__).resolve().parent.parent
 PROTECTED = {"Parameters.md", "Preferences.md", "Workspace map.md", "Index.md", "AGENTS.md", "CLAUDE.md", ".gitignore"}
-EXECUTABLES = {"setup", "check-migration", "check-onboarding", "check-docs", "guard", "upgrade", "file-session", "load-host", "check-vault", "build-views", "build-bootstrap", "build-runtime-manifest"}
+EXECUTABLES = {"setup", "check-migration", "check-onboarding", "check-docs", "check-release", "guard", "upgrade", "file-session", "load-host", "check-vault", "build-views", "build-bootstrap", "build-runtime-manifest"}
 
 
 def read_manifest(path):

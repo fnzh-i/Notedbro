@@ -20,10 +20,10 @@ User notes, maps, preferences, parameters, existing company/project instructions
 
 Passed locally on macOS with Python 3.9.6:
 
-- All 23 onboarding/migration integration tests, including empty-home setup, idempotence, custom configuration preservation, unsafe paths, inherited-CI guard regression, web-only behavior, exported-release setup, and execution of the README command block against a local private-copy fixture.
+- All 24 onboarding/migration integration tests, including empty-home setup, idempotence, custom configuration preservation, unsafe paths, inherited-CI guard regression, web-only behavior, exported-release setup, and execution of the README command block against a local private-copy fixture.
 - Concurrent legacy/local hook delivery, replay without duplicate notes/index/Daily entries, and failure recovery.
 - Codex transcript parsing with request, model, recognized edit, and Daily output.
-- Historical manifest verification against all 75 files of the pinned v1.0.0 commit; current runtime manifest covers 29 shipped files.
+- Historical manifest verification against all 75 files of the pinned v1.0.0 commit; the runtime manifest covers every shipped runtime file.
 - Documentation link/path checks, collaboration/file-session/provenance validators, structural starter validation, all six existing script self-checks, and git diff whitespace validation.
 
 ## Remaining release gates
@@ -41,3 +41,17 @@ The exported-release test and publication self-check now use a synthetic fixture
 Files touched: `_Scripts/check-onboarding`, `_Scripts/publish`, the regenerated `_Scripts/release-runtime.sha256`, and this report. No user content, host configuration, workflow permissions, historical checksums, or production scanner rules changed.
 
 Validation on macOS/Python 3.9.6: all 24 onboarding tests passed, including a separate full-suite run simulating the hosted account; all repository validators and six script self-checks passed; all 75 historical hashes verified. The hosted Actions matrix still needs a rerun after this local commit is pushed.
+
+## Release evidence
+
+Record evidence without inferring one environment from another:
+
+| Gate | Commit | Environment/version | Result | Evidence |
+|---|---|---|---|---|
+| Clean release check | Current PR candidate | macOS, Python 3.9.6 | Passed | 24 full-checkout onboarding tests; 75 historical and 31 runtime files; clean-export validators and self-checks |
+| GitHub matrix | Pending | macOS, Ubuntu, Windows; Python 3.9 and 3.15 | Pending | Actions run URL |
+| Claude first session | Pending | Installed Claude version | Pending | Concise observed result |
+| Cursor first session | Pending | Installed Cursor version | Pending | Concise observed result |
+| Codex manual filing | Pending | Installed Codex version | Pending | Concise observed result |
+| Web paste/save | Pending | Browser and version | Pending | Concise observed result |
+| Private template copy | Pending | Authorized private repository | Pending | Repository or run URL |

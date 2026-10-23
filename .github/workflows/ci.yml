@@ -40,6 +40,9 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
 
+      - name: Check runtime manifest
+        run: python _Scripts/build-runtime-manifest --check
+
       - name: Install system dependencies
         if: runner.os == 'Linux'
         run: |
@@ -50,36 +53,21 @@ jobs:
         if: runner.os == 'macOS'
         run: brew install age zstd
 
-      - name: Check onboarding and migration
+      - name: Check release candidate
         if: runner.os != 'Windows'
-        run: |
-          python _Scripts/check-onboarding
-          python _Scripts/check-docs
-          python _Scripts/check-migration verify-baseline
-          python _Scripts/build-runtime-manifest --check
+        run: python _Scripts/check-release
 
-      - name: Run repository validators
+      - name: Run Windows repository validators
+        if: runner.os == 'Windows'
         run: |
           python _Scripts/check-collaboration
           python _Scripts/check-file-session
           python _Scripts/check-provenance-tags
           python _Scripts/check-vault
 
-      - name: Run script self-checks
-        if: runner.os != 'Windows'
-        run: |
-          _Scripts/guard self-check
-          _Scripts/upgrade self-check
-          python _Scripts/publish self-check
-          python _Scripts/sync self-check
-          python _Scripts/rebuild self-check
-          python _Scripts/shadow self-check
-          python _Scripts/ship self-check
-
       - name: Check Windows Ship and release integrity
         if: runner.os == 'Windows'
         run: |
           python _Scripts/check-migration verify-baseline
-          python _Scripts/build-runtime-manifest --check
           python _Scripts/ship self-check
           python _Scripts/publish self-check

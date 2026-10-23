@@ -84,7 +84,7 @@ PUBLIC_OWNED = (
     "Workspace map.advanced.example.md", "Workspace map.example.md",
     "README.md", "How to set up.md", "CONTRIBUTING.md", "SECURITY.md", "CHANGELOG.md",
     "Hosts.md", "Hosts/Claude.md", "Hosts/Cursor.md", "Hosts/Web.md",
-    "_Scripts/check-docs", "_Scripts/check-onboarding", "_Scripts/onboarding.py",
+    "_Scripts/check-docs", "_Scripts/check-onboarding", "_Scripts/check-release", "_Scripts/onboarding.py",
     "_Scripts/setup", "_Scripts/starter-manifest.txt", "assets/branding/notedbro.png",
 )
 
@@ -221,7 +221,8 @@ def gitignore_text(vault=None):
 
 def write(path, text):
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(text, encoding="utf-8")
+    with path.open("w", encoding="utf-8", newline="\n") as handle:
+        handle.write(text)
 
 
 def public_main(out):
@@ -406,7 +407,18 @@ def _self_check():
         denylist = root / "denylist"
         planted_project = "Quill" + "stone Labs"
         planted_email = "ada" + "@" + "example.org"
-        denylist.write_text("# test terms\n" + planted_project + "\n" + "ZQ" + "-\n" + "Sample" + "town\n")
+        denylist.write_text("# test terms\n" + planted_project + "\n" + "ZQ" + "-\n" + "Sample" + "town\n", encoding="utf-8")
+
+        utf8_probe = root / "utf8-probe"
+        utf8_expected = "├─ UTF-8 output\n"
+        write(utf8_probe, utf8_expected)
+        utf8_bytes = utf8_probe.read_bytes()
+        try:
+            utf8_text = utf8_bytes.decode("utf-8")
+        except UnicodeDecodeError:
+            raise SystemExit("self-check: publish writes were not UTF-8")
+        if utf8_text != utf8_expected or b"\r\n" in utf8_bytes:
+            raise SystemExit("self-check: publish writes did not use LF line endings")
 
         source = Path(__file__).resolve().parent.parent
         files, _missing = included(source)

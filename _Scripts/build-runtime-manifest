@@ -5,19 +5,74 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import migration
 
-root = Path(__file__).resolve().parent.parent
-lines = ["# Notedbro 1.1.0 runtime checksums. Regenerate after changing shipped runtime files."]
-for rel, path in sorted(migration.release_files(root).items()):
-    if rel.startswith("_Scripts/") and path.suffix != ".sha256":
-        lines.append(migration.sha(path) + "  " + rel)
-output = root / "_Scripts/release-runtime.sha256"
-data = "\n".join(lines) + "\n"
-if len(sys.argv) == 2 and sys.argv[1] == "--check":
-    if not output.exists() or output.read_bytes() != data.encode("utf-8"):
-        raise SystemExit("Runtime checksum manifest is stale; run python3 _Scripts/build-runtime-manifest.")
-elif len(sys.argv) == 1:
-    if not output.exists() or output.read_bytes() != data.encode("utf-8"):
-        output.write_bytes(data.encode("utf-8"))
-else:
-    raise SystemExit("Usage: build-runtime-manifest [--check]")
-print(f"Runtime checksums: {len(lines) - 1} files")
+HEADER = "# Notedbro 1.1.0 runtime checksums. Regenerate after changing shipped runtime files."
+
+
+def runtime_hashes(root):
+    hashes = {}
+    for rel, path in sorted(migration.release_files(root).items()):
+        if rel.startswith("_Scripts/") and path.suffix != ".sha256":
+            hashes[rel] = migration.sha(path)
+    return hashes
+
+
+def render(root):
+    lines = [HEADER]
+    for rel, checksum in runtime_hashes(root).items():
+        lines.append(checksum + "  " + rel)
+    return ("\n".join(lines) + "\n").encode("utf-8")
+
+
+def problems(root):
+    root = Path(root)
+    output = root / "_Scripts/release-runtime.sha256"
+    if not output.is_file():
+        return ["Missing runtime manifest: _Scripts/release-runtime.sha256"]
+    try:
+        actual = migration.read_manifest(output)
+    except (OSError, ValueError) as error:
+        return [f"Invalid runtime manifest: {error}"]
+    expected = runtime_hashes(root)
+    found = []
+    for rel in sorted(set(expected) - set(actual)):
+        found.append(f"Missing runtime entry: {rel}")
+    for rel in sorted(set(actual) - set(expected)):
+        found.append(f"Unexpected runtime entry: {rel}")
+    for rel in sorted(set(expected) & set(actual)):
+        if actual[rel] != expected[rel]:
+            found.append(f"Runtime checksum mismatch: {rel}")
+    if not found and output.read_bytes() != render(root):
+        found.append("Runtime manifest header or formatting differs")
+    return found
+
+
+def write_manifest(root):
+    root = Path(root)
+    data = render(root)
+    (root / "_Scripts/release-runtime.sha256").write_bytes(data)
+    return len(data.splitlines()) - 1
+
+
+def main(argv):
+    root = Path(__file__).resolve().parent.parent
+    output = root / "_Scripts/release-runtime.sha256"
+    data = render(root)
+    if len(argv) == 1 and argv[0] == "--check":
+        found = problems(root)
+        if found:
+            detail = "\n".join(f"- {problem}" for problem in found)
+            raise SystemExit(
+                "Runtime checksum manifest is stale:\n"
+                + detail
+                + "\nRun python3 _Scripts/build-runtime-manifest after the final runtime edit."
+            )
+    elif not argv:
+        if not output.exists() or output.read_bytes() != data:
+            output.write_bytes(data)
+    else:
+        raise SystemExit("Usage: build-runtime-manifest [--check]")
+    print(f"Runtime checksums: {len(data.splitlines()) - 1} files")
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])
