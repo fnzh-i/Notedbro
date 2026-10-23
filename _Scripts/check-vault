@@ -273,7 +273,11 @@ def main():
     if problems:
         print("\n".join(problems))
         raise SystemExit(1)
-    print(f"Vault ok. Notedbro v{notedbro_version()}.")
+    if not (VAULT / "Workspace map.md").is_file():
+        print(f"Starter files ok. Notedbro v{notedbro_version()}.")
+        print("Setup incomplete: Workspace map.md is missing. Run python3 _Scripts/setup <host>.")
+    else:
+        print(f"Vault ok. Notedbro v{notedbro_version()}.")
 
 
 if __name__ == "__main__":

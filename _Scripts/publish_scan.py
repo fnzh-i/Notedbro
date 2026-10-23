@@ -20,6 +20,9 @@ MAINTAINER_MESSAGE = (
 DENYLIST_MESSAGE = "Edit your denylist first. It still has the sample words."
 SHORT_DENYLIST = "Edit your denylist first. It needs at least three terms that are not samples."
 PRIVATE_PREFIXES = (
+    ".notedbro-local/",
+    ".claude/settings.local.json",
+    ".claude/hooks/notedbro.py",
     "Personal/",
     "Plans/",
     "Skill files/",
@@ -29,6 +32,7 @@ PRIVATE_PREFIXES = (
 KNOWN_PRIVATE_TOP = {
     "Personal", "Work", "Collaboration", "Hackathons", "Research", "Plans",
     "Skill files", ".obsidian",
+    ".notedbro-local",
 }
 PUBLIC_REPO = "https://github.com/fnzh-i/Notedbro"
 PUBLIC_API = "https://api.github.com/repos/fnzh-i/Notedbro"
@@ -77,7 +81,7 @@ def read_terms(path):
     if not path.is_file():
         return []
     terms = []
-    for line in path.read_text(errors="replace").splitlines():
+    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
         line = line.strip()
         if line and not line.startswith("#"):
             terms.append(line)
@@ -146,6 +150,8 @@ def _line_hits(text, terms, home, login, product_name, allow_product, rel=""):
             kinds.append("phone")
         if home and home in line:
             kinds.append("home folder")
+        # GitHub Actions exposes its OS through the exact expression
+        # `runner.os`. A runner login must still be found everywhere else.
         login_line = line
         if login.pattern.endswith("runner(?![A-Za-z0-9_-])") and rel == ".github/workflows/ci.yml":
             login_line = re.sub(r"(?<![A-Za-z0-9_-])runner\.os(?![A-Za-z0-9_-])", "", line)
@@ -253,7 +259,7 @@ def read_manifest(vault):
     files, dirs = [], []
     if not path.is_file():
         return files, dirs
-    for line in path.read_text(errors="replace").splitlines():
+    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
         line = line.strip()
         if not line or line.startswith("#"):
             continue
